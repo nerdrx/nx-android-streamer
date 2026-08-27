@@ -105,6 +105,16 @@ class CameraBridge(
      */
     fun prepare(pc: PeerConnection, offerSdp: String) {
         sender = null
+        // Only claim the section if the user actually allows the camera. A
+        // sendonly transceiver with no track makes setLocalDescription fail
+        // outright ("failed to set local video description recv parameters"),
+        // which killed the WHOLE session — video and audio with it — for
+        // everyone who left the camera toggle off. Leaving it untouched answers
+        // a=inactive, which is exactly what "no camera" should look like.
+        if (!prefs.allowRemoteCamera) {
+            Log.d(TAG, "camera not allowed; leaving the offered section inactive")
+            return
+        }
         val mid = recvonlyVideoMid(offerSdp) ?: return
         val transceiver = try {
             pc.transceivers.firstOrNull { it.mid == mid }

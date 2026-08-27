@@ -244,16 +244,12 @@ cmd_stream() {
     # NXAS_AUDIO=none / NXAS_CAMERA=none turn them off.
     local audio camera
     audio=${NXAS_AUDIO:-auto}
-    camera=${NXAS_CAMERA:-}
-    if [[ -z $camera ]]; then
-        # First v4l2loopback node the container can also see, else nothing.
-        for n in /dev/video*; do
-            if v4l2-ctl -d "$n" --info 2>/dev/null | grep -qi 'v4l2 loopback'; then
-                camera=$n; break
-            fi
-        done
-        camera=${camera:-none}
-    fi
+    # Camera stays OFF by default until it can be negotiated on demand.
+    # Offering a recvonly m=video up front makes android's libwebrtc fail the
+    # whole answer ("failed to set local video description recv parameters"),
+    # taking video AND audio down with it — even when the client declines the
+    # section. Opt in with NXAS_CAMERA=/dev/videoN once that is fixed.
+    camera=${NXAS_CAMERA:-none}
     log "audio: $audio   camera: $camera"
 
     python "$ROOT/server/nx-streamerd.py" \
