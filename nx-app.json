@@ -1,0 +1,33 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nerdrx/nx-hub/main/registry/nx-app.schema.json",
+  "nxApp": 1,
+  "name": "NX Android Streamer",
+  "tagline": "Your PC is the phone, your phone is the glass — stream a full Android that feels native",
+  "homepage": "https://github.com/nerdrx/nx-android-streamer",
+  "artifacts": [
+    {
+      "assetPattern": "nx-android-streamer-*-linux-x86_64.tar.gz",
+      "label": "Server rig (Linux)",
+      "kind": "archive-dir",
+      "platform": "linux",
+      "binHint": "start.sh",
+      "args": ["up"],
+      "postInstallNote": "One-time setup needs root for Waydroid: from the install directory run './start.sh setup' then './start.sh arm'. After that, Launch boots the headless Android session."
+    },
+    {
+      "assetPattern": "nx-android-streamer-*.apk",
+      "label": "Phone client",
+      "kind": "apk-adb",
+      "platform": "android",
+      "packageId": "dev.nerdrx.nxandroidstreamer"
+    }
+  ],
+  "connector": {
+    "fields": [
+      { "key": "state", "label": "Session", "kind": "text" },
+      { "key": "bitrate", "label": "Bitrate", "unit": "Mbps", "kind": "number" },
+      { "key": "latency", "label": "Glass to glass", "unit": "ms", "kind": "number" },
+      { "key": "client", "label": "Phone linked", "kind": "bool" }
+    ]
+  }
+}
