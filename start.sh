@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # nx-android-streamer — starter script
 # Brings up a headless Waydroid session at phone geometry, ready for a streamer.
-# Subcommands: setup | arm | up | serve | stream | doctor | down | status | ref
+# Subcommands: setup | arm | up | serve | gui | stream | doctor | down | status | ref
 set -euo pipefail
 
 W=${NXAS_WIDTH:-1080}
@@ -46,6 +46,8 @@ cmd_setup() {
     pacman -Q gst-plugins-ugly &>/dev/null || pkgs+=(gst-plugins-ugly)   # x264enc software fallback
     python -c 'import aiohttp' 2>/dev/null || pkgs+=(python-aiohttp)
     python -c 'import evdev'   2>/dev/null || pkgs+=(python-evdev)
+    python -c 'import PySide6' 2>/dev/null || pkgs+=(pyside6)        # tray gui
+    python -c 'import qrcode'  2>/dev/null || pkgs+=(python-qrcode)  # tray gui QR
     if ((${#pkgs[@]})); then
         log "installing: ${pkgs[*]}"
         sudo pacman -S --needed "${pkgs[@]}" || die "pacman failed — AUR-only package? try paru -S ${pkgs[*]}"
@@ -141,6 +143,15 @@ EOF
 
     log "up ✓  wayland display: $disp — android is booting inside it"
     log "streamer hookup: WAYLAND_DISPLAY=$disp (nx-streamerd / './start.sh ref' for sunshine baseline)"
+}
+
+# ------------------------------------------------------------------ gui ----
+cmd_gui() {
+    # Tray control panel — the non-CLI front door. Start/stop the stream,
+    # live status, pairing QR, close-to-tray. Needs pyside6 (setup installs it).
+    python -c 'import PySide6' 2>/dev/null \
+        || die "the tray app needs PySide6 — sudo pacman -S pyside6 python-qrcode (or re-run ./start.sh setup)"
+    exec python "$ROOT/gui/nx_tray.py"
 }
 
 # ---------------------------------------------------------------- serve ----
@@ -353,6 +364,7 @@ case "${1:-help}" in
     arm)    cmd_arm ;;
     up)     cmd_up ;;
     serve)  cmd_serve "${@:2}" ;;
+    gui)    cmd_gui ;;
     stream) cmd_stream "${@:2}" ;;
     down)   cmd_down ;;
     status) cmd_status ;;

@@ -86,6 +86,8 @@ fork it.
 ./start.sh setup    # checks binder, installs waydroid+sway, init GAPPS, sets 1080×2400
 ./start.sh arm      # ARM translation (libndk) + Widevine via casualsnek/waydroid_script
 ./start.sh up       # boots the headless Android session
+./start.sh serve    # session + stream in one (this is what NX Hub's Launch runs)
+./start.sh gui      # tray control panel: start/stop, live status, pairing QR
 ./start.sh stream   # captures it and serves the WebRTC stream (foreground)
 ./start.sh status   # what's running
 ./start.sh ref      # optional: Sunshine on the session, as a latency baseline

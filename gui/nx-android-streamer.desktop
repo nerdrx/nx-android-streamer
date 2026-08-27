@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=NX Android Streamer
+Comment=Your PC is the phone, your phone is the glass
+Exec=sh -c '"$(dirname "$(readlink -f "%k")")/../start.sh" gui'
+Icon=phone
+Terminal=false
+Categories=Network;Utility;
