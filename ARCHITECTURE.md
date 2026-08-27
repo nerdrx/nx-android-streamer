@@ -73,8 +73,44 @@ signaling server is a small piece of nx-streamerd and never leaves the VPN.
 If measured glass-to-glass latency hits WebRTC's jitter-buffer floor and it
 matters in practice, v1.x swaps in a raw UDP transport modeled on WiVRn's.
 
-Adaptive bitrate: port the shape of the auto-bitrate work from our WiVRn fork —
-observe RTT/loss from RTCP, feed encoder bitrate/keyframe decisions.
+Adaptive bitrate (done, v0.1): the shape of the auto-bitrate work from our WiVRn
+fork, ported to `webrtcbin`'s `get-stats`. `AdaptiveBitrate` in
+`server/nx-streamerd.py` samples once a second while a client is attached, takes
+per-interval deltas of `packets-sent` / `packets-lost` off the `outbound-rtp` and
+`remote-inbound-rtp` entries plus a smoothed `round-trip-time`, and drives the
+encoder's `bitrate` property:
+
+- loss > 5%, or smoothed RTT above both 150 ms and 2x the session floor →
+  multiplicative decrease (x0.70) plus an upstream force-key-unit, so the client
+  recovers on an IDR instead of waiting out the 2 s GOP;
+- loss < 1% with calm RTT for 5 consecutive samples → additive increase of 10%
+  of the ceiling;
+- anything between → hold.
+
+Clamped to `[--min-bitrate, --bitrate]`, at most one change per second, and a 3 s
+settle window after every (re)negotiation. A session starts at 60% of the ceiling
+and probes upward: the failure this fixes is the *first* seconds of a mobile
+session, where a full-rate stream punched into an unmeasured 5G uplink takes the
+connection down with it. `--no-abr` pins the encoder to `--bitrate`.
+
+GCC exists inside `webrtcbin`, but nothing in this pipeline listened to it — the
+encoder is a `vah264enc` with a plain `bitrate` property that GCC has never heard
+of. This class is that missing wire.
+
+Manual control (config channel): the client may send
+`{"type":"config","bitrate":<kbps>,"fps":<n>,"abr":<bool>}` on the **signaling
+websocket** — not the input datachannel, which stays input-only, so config works
+before the datachannel opens. Any field may be absent or null ("leave alone").
+The server clamps hard (bitrate 500..50000 kbps, fps 15..120), ignores junk, and
+always answers with the effective state:
+`{"type":"config","bitrate":N,"fps":N,"abr":b,"min_bitrate":N,"max_bitrate":N}`.
+The same frame is pushed unsolicited right behind every offer, so a fresh client
+never has to ask. A manual bitrate moves the *ceiling*, not just the
+instantaneous value; `abr:false` pins the encoder there. Framerate is baked into
+the wf-recorder command line and the `rawvideoparse` caps, so an fps change tears
+down capture + pipeline and re-offers to the same websocket — the client only
+ever answers, never offers, so a fresh offer is always legal. Nothing is
+persisted server-side; the client owns its preferences.
 
 ## Client
 

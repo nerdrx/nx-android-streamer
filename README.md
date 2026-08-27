@@ -99,8 +99,18 @@ Tailscale/WireGuard — the signaling server never listens on the open internet)
 and add it to the home screen. One client at a time; the newest wins.
 
 Geometry is overridable: `NXAS_WIDTH/NXAS_HEIGHT/NXAS_HZ` (defaults 1080/2400/90,
-i.e. a Pixel 7). The streamer also takes `NXAS_FPS` (60), `NXAS_BITRATE` (12000
-kbps) and `NXAS_PORT` (8765).
+i.e. a Pixel 7). The streamer also takes `NXAS_FPS` (60), `NXAS_BITRATE` (8000
+kbps), `NXAS_MIN_BITRATE` (1500 kbps) and `NXAS_PORT` (8765).
+
+`NXAS_BITRATE` is a **ceiling**, not a fixed rate: the daemon watches RTCP loss
+and round-trip time and moves the encoder between `NXAS_MIN_BITRATE` and that
+ceiling about once a second, starting a session below it and probing upward.
+That is what keeps a 5G uplink from being overrun — a fixed 12 Mbps at
+1080x2400 drops the connection. Pass `--no-abr` to `nx-streamerd.py` to turn
+adaptation off and pin the encoder to `--bitrate`, and `--min-bitrate` to raise
+or lower the floor. The phone can also set bitrate, framerate and the adaptive
+switch at runtime over the signaling socket; the server clamps whatever it asks
+for and answers with the settings actually in force.
 
 Note: this is an uncertified Android container. Play Store works after device
 registration, but Play-Integrity-gated apps (banking, Wallet) won't, and DRM is

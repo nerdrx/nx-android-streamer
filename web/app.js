@@ -10,6 +10,16 @@
  *     -> {"type":"answer","sdp":"..."}
  *    <-> {"type":"ice","candidate":"<candidate string>","sdpMLineIndex":N}
  *   No STUN/TURN: everything rides the Tailscale network, host candidates only.
+ *   The server may re-offer at any time (an fps change rebuilds its pipeline);
+ *   we always answer and never offer, so a second offer is business as usual.
+ *
+ * Config channel (same websocket, so it works before the datachannel opens):
+ *     -> {"type":"config","bitrate":<kbps>,"fps":<n>,"abr":<bool>}   any subset
+ *     <- {"type":"config","bitrate":N,"fps":N,"abr":b,
+ *         "min_bitrate":N,"max_bitrate":N}
+ *   The reply is always the *effective* state, and arrives unsolicited right
+ *   after every offer. This client has no settings UI yet; window.nxConfig()
+ *   reads the last snapshot and window.nxSetConfig({...}) sends one.
  *
  * Input datachannel (server-created, label "input"), one JSON object per message:
  *     {"t":"td","id":N,"x":F,"y":F}   touch down
@@ -67,6 +77,15 @@
   var live = false;           // media flowing and datachannel open
   var stopped = false;        // page is going away; stop retrying
   var attempts = 0;           // connection attempts this page load
+  var serverConfig = null;    // last {"type":"config"} snapshot from the server
+
+  // A server-side rebuild (fps change) re-offers on the live websocket. The old
+  // datachannel and ICE transport die on the way through, which every one of our
+  // health checks would otherwise read as "the link broke, reconnect". This
+  // timestamp is how long we let that churn pass without panicking.
+  var RENEGOTIATE_GRACE_MS = 15000;
+  var renegotiatingUntil = 0;
+  function renegotiating() { return Date.now() < renegotiatingUntil; }
 
   // ---------------------------------------------------------------------
   // Status pill
@@ -163,6 +182,9 @@
     pc.ondatachannel = function (ev) {
       if (myGen !== gen) return;
       if (ev.channel.label !== 'input') return;
+      if (dc) {   // a rebuild hands us a second one; unhook the corpse first
+        dc.onopen = dc.onmessage = dc.onclose = dc.onerror = null;
+      }
       dc = ev.channel;
       dc.onopen = function () {
         if (myGen !== gen) return;
@@ -177,6 +199,11 @@
       };
       dc.onclose = function () {
         if (myGen !== gen) return;
+        if (this !== dc) return;        // superseded by a rebuild's channel
+        if (renegotiating()) {
+          log('input channel closed during renegotiation — waiting');
+          return;
+        }
         log('input channel closed');
         scheduleReconnect(myGen);
       };
@@ -203,6 +230,7 @@
       } else if (st === 'disconnected') {
         // 'disconnected' can self-heal; give ICE a moment before we nuke it.
         setTimeout(function () {
+          if (renegotiating()) return;
           if (myGen === gen && pc && pc.connectionState === 'disconnected') {
             scheduleReconnect(myGen);
           }
@@ -250,6 +278,15 @@
     if (!msg || !msg.type) return;
 
     if (msg.type === 'offer') {
+      if (pc.remoteDescription) {
+        // Second (or later) offer on a live session: the server rebuilt its
+        // pipeline, e.g. because the framerate changed. Same websocket, same
+        // peer connection — just answer again and ride out the transport churn.
+        log('renegotiation offer');
+        renegotiatingUntil = Date.now() + RENEGOTIATE_GRACE_MS;
+        live = false;
+        setPhase('reconnecting');
+      }
       var desc = { type: 'offer', sdp: msg.sdp };
       pc.setRemoteDescription(desc)
         .then(function () { return pc.createAnswer(); })
@@ -287,6 +324,16 @@
       return;
     }
 
+    if (msg.type === 'config') {
+      // Effective server settings. No UI for these yet — the Kotlin client owns
+      // that — but keeping the snapshot means window.nxConfig() tells the truth.
+      serverConfig = msg;
+      log('config', msg.bitrate + ' kbps', msg.fps + ' fps',
+          'abr=' + msg.abr, '[' + msg.min_bitrate + '..' + msg.max_bitrate + ']',
+          msg.note || '');
+      return;
+    }
+
     if (msg.type === 'answer') return;  // we are never the offerer
     log('unhandled signal', msg.type);
   }
@@ -304,6 +351,7 @@
     var pcOk = !!pc && (pc.connectionState === 'connected' || pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed');
     if (mediaOk && chanOk && pcOk) {
       live = true;
+      renegotiatingUntil = 0;          // whatever we were riding out is over
       retryDelay = RECONNECT_MIN_MS;   // a good connection resets the backoff
       setPhase('live');
       log('live');
@@ -318,7 +366,7 @@
       if (!dc || dc.readyState !== 'open') return;
       // A dead link that never closes cleanly (phone slept, NAT rebind) shows up
       // as pongs going missing long before the socket notices.
-      if (live && Date.now() - lastPongAt > PONG_TIMEOUT_MS) {
+      if (live && !renegotiating() && Date.now() - lastPongAt > PONG_TIMEOUT_MS) {
         log('pong timeout');
         scheduleReconnect(myGen);
         return;
@@ -681,6 +729,26 @@
     lastPhase = null;
     reconnectNow();
   });
+
+  // ---------------------------------------------------------------------
+  // Manual control, for now console-only
+  //
+  //   nxConfig()                       -> last effective settings
+  //   nxSetConfig({bitrate: 6000})     -> cap at 6 Mbps (ABR stays on)
+  //   nxSetConfig({abr: false})        -> pin where we are
+  //   nxSetConfig({fps: 30})           -> server rebuilds and re-offers
+  // ---------------------------------------------------------------------
+
+  window.nxConfig = function () { return serverConfig; };
+  window.nxSetConfig = function (fields) {
+    if (!fields || typeof fields !== 'object') return false;
+    var out = { type: 'config' };
+    ['bitrate', 'fps', 'abr'].forEach(function (k) {
+      if (k in fields) out[k] = fields[k];
+    });
+    send(out);
+    return true;
+  };
 
   // ---------------------------------------------------------------------
   // Go

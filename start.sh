@@ -240,7 +240,8 @@ cmd_stream() {
     python "$ROOT/server/nx-streamerd.py" \
         --wayland-display "$disp" \
         --width "$W" --height "$H" --fps "$fps" \
-        --bitrate "${NXAS_BITRATE:-12000}" \
+        --bitrate "${NXAS_BITRATE:-8000}" \
+        --min-bitrate "${NXAS_MIN_BITRATE:-1500}" \
         --port "$port" "$@"
     [[ -n "$avahi_pid" ]] && kill "$avahi_pid" 2>/dev/null || true
 }

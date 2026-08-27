@@ -411,6 +411,7 @@ class AdaptiveBitrate:
         self._stopped = False
         self._failed = False
         self._source_id = None
+        self._dumped = False        # NXAS_DEBUG: dump the raw reply once
 
     # -- lifecycle ----------------------------------------------------------
     def start(self) -> None:
@@ -480,11 +481,29 @@ class AdaptiveBitrate:
             reply = promise.get_reply()
             if reply is None:
                 return
+            if _DEBUG and not self._dumped:
+                # The one thing worth having when a field name changes under us
+                # in some future GStreamer: the actual shape webrtcbin returned,
+                # one entry per line so it is readable in a terminal.
+                self._dumped = True
+                self._dump(reply)
             sample = self._extract(reply)
             if sample is not None:
                 self._evaluate(*sample)
         except Exception as exc:
             self._disable(f"stats handling failed: {exc!r}")
+
+    @staticmethod
+    def _dump(reply) -> None:
+        """NXAS_DEBUG only: one line per stats entry."""
+        try:
+            for i in range(reply.n_fields()):
+                key = reply.nth_field_name(i)
+                entry = reply.get_value(key)
+                if isinstance(entry, Gst.Structure):
+                    dbg(f"abr: stat {entry.get_name()}: {entry.to_string()[:900]}")
+        except Exception as exc:
+            dbg(f"abr: could not dump stats ({exc!r})")
 
     # -- parsing ------------------------------------------------------------
     @staticmethod
@@ -563,8 +582,13 @@ class AdaptiveBitrate:
                 lost = self._num(entry, "packets-lost")
                 if lost is not None:
                     lost_remote = lost if lost_remote is None else lost_remote + lost
-                value = self._num(entry, "round-trip-time")   # seconds
-                if value is not None and value > 0 and rtt is None:
+                # Seconds, as a double. Reported as 0 until the first RTCP RR
+                # that references one of our sender reports comes back, and on
+                # a loopback/LAN peer it can stay 0: GStreamer carries it in
+                # NTP 16.16 fixed point, so anything under ~15 us truncates to
+                # nothing. Policy about that lives in _evaluate, not here.
+                value = self._num(entry, "round-trip-time")
+                if value is not None and rtt is None:
                     rtt = value
         if out_sent is None:
             return None                      # nothing sent yet
@@ -573,6 +597,21 @@ class AdaptiveBitrate:
 
     # -- control law --------------------------------------------------------
     def _evaluate(self, packets_sent, packets_lost, bytes_sent, rtt) -> None:
+        # RTT is an absolute reading, not a delta, so it counts even on the
+        # baseline sample — and it *must*, because the session floor is taken
+        # from the first reading we keep. Throwing the baseline's RTT away made
+        # the second sample define the floor, so a link that went bad right
+        # after connecting had its bad RTT enshrined as "normal" and the spike
+        # test could never fire again.
+        #
+        # A zero is "not measured yet" (or a link too fast for the 16.16 fixed
+        # point RTCP carries it in), not "zero latency": feeding it in would
+        # drag the floor to 0 and make everything after it look like a spike.
+        if rtt is not None and rtt > 0:
+            self._rtt_ewma = rtt if self._rtt_ewma is None else (
+                self.RTT_EWMA_ALPHA * rtt + (1 - self.RTT_EWMA_ALPHA) * self._rtt_ewma)
+            self._rtt_min = rtt if self._rtt_min is None else min(self._rtt_min, rtt)
+
         prev, self._prev = self._prev, (packets_sent, packets_lost, bytes_sent)
         if prev is None:
             return                           # first sample is only a baseline
@@ -589,18 +628,15 @@ class AdaptiveBitrate:
         # arrive. Negative loss over an interval is not a windfall; it is zero.
         d_lost = max(0.0, d_lost)
 
-        if rtt is not None:
-            self._rtt_ewma = rtt if self._rtt_ewma is None else (
-                self.RTT_EWMA_ALPHA * rtt + (1 - self.RTT_EWMA_ALPHA) * self._rtt_ewma)
-            self._rtt_min = rtt if self._rtt_min is None else min(self._rtt_min, rtt)
-
         expected = d_sent + d_lost
         loss_pct = (100.0 * d_lost / expected) if expected > 0 else 0.0
         rtt_ms = None if self._rtt_ewma is None else self._rtt_ewma * 1000.0
 
         self._notify(rtt_ms)
         dbg(f"abr: sample d_sent={int(d_sent)} d_lost={int(d_lost)} "
-            f"loss={loss_pct:.1f}% rtt={'?' if rtt_ms is None else f'{rtt_ms:.0f}ms'} "
+            f"loss={loss_pct:.1f}% "
+            f"rtt={'none' if rtt is None else f'{rtt * 1000.0:.3f}ms raw'}/"
+            f"{'?' if rtt_ms is None else f'{rtt_ms:.0f}ms'} "
             f"at {self.current_kbps} kbps")
 
         now = time.monotonic()
@@ -791,15 +827,20 @@ class Streamer:
             f"! webrtcbin name=webrtc bundle-policy=max-compat"
         )
 
-    def start(self, send_json) -> None:
+    def start(self, send_json, fatal: bool = True) -> None:
+        """Runs in an executor thread (parse_launch + state changes block).
+
+        fatal=False is for a mid-session rebuild (a live fps change): the caller
+        wants to roll back and try again, not take the daemon down.
+        """
         self._tearing_down = False        # a fault from here on is a real fault
-        """Runs in an executor thread (parse_launch + state changes block)."""
         try:
             self._start(send_json)
         except StreamError as exc:
             err(f"session: {exc}")
             self.stop()
-            self.on_fatal(1)
+            if fatal:
+                self.on_fatal(1)
             raise
 
     def _start(self, send_json) -> None:
@@ -827,6 +868,7 @@ class Streamer:
                     "gst-plugins-bad, vah264enc from gst-plugin-va.")
 
             venc = self.pipeline.get_by_name("venc")
+            self.venc = venc
             configure_encoder(venc, self.encoder_name, self.args.bitrate, self.args.fps)
 
             pay = self.pipeline.get_by_name("pay")
@@ -869,27 +911,69 @@ class Streamer:
             # so one bad link never leaves the next one throttled. Building it
             # must never be able to stop the stream from starting.
             if self.args.no_abr:
-                log(f"abr: off (--no-abr) — pinned to {self.args.bitrate} kbps")
+                log(f"abr: off — pinned to {self.args.bitrate} kbps")
+                if self.on_abr is not None:
+                    self.on_abr(self.args.bitrate, None)
             else:
-                try:
-                    self.abr = AdaptiveBitrate(
-                        webrtc=self.webrtc,
-                        encoder=venc,
-                        encoder_name=self.encoder_name,
-                        max_kbps=self.args.bitrate,
-                        min_kbps=self.args.min_bitrate,
-                        on_sample=self.on_abr,
-                    )
-                    self.abr.start()
-                except Exception as exc:
-                    err(f"abr: could not start ({exc!r}) — fixed bitrate "
-                        f"{self.args.bitrate} kbps for this session")
-                    self.abr = None
+                self.start_abr()
 
             self._setup_done = True
         # Offer only once everything above is wired; on-negotiation-needed may
         # already have fired and parked itself in _negotiation_wanted.
         GLib.idle_add(self._maybe_offer)
+
+    # -- live control (manual config channel + ABR) -------------------------
+    def start_abr(self, start_kbps=None) -> bool:
+        """Arm the adaptive controller on the running pipeline.  Building it
+        must never be able to stop or kill the stream."""
+        if self.abr is not None or self.webrtc is None or self.venc is None:
+            return self.abr is not None
+        try:
+            self.abr = AdaptiveBitrate(
+                webrtc=self.webrtc,
+                encoder=self.venc,
+                encoder_name=self.encoder_name,
+                max_kbps=self.args.bitrate,
+                min_kbps=self.args.min_bitrate,
+                on_sample=self.on_abr,
+                start_kbps=start_kbps,
+            )
+            self.abr.start()
+            return True
+        except Exception as exc:
+            err(f"abr: could not start ({exc!r}) — fixed bitrate "
+                f"{self.args.bitrate} kbps for this session")
+            self.abr = None
+            return False
+
+    def stop_abr(self) -> None:
+        if self.abr is not None:
+            self.abr.stop()
+            self.abr = None
+
+    def current_bitrate(self):
+        """What the encoder is actually running at, kbps, or None if idle."""
+        if self.abr is not None:
+            return self.abr.current_kbps
+        enc = self.venc
+        if enc is None:
+            return None
+        try:
+            return int(enc.get_property("bitrate"))
+        except Exception:
+            return None
+
+    def set_bitrate_now(self, kbps: int) -> bool:
+        """Pin the encoder, bypassing the controller (manual mode)."""
+        enc = self.venc
+        if enc is None:
+            return False
+        try:
+            enc.set_property("bitrate", int(kbps))
+            return True
+        except Exception as exc:
+            warn(f"encoder: manual bitrate {kbps} rejected ({exc})")
+            return False
 
     def _create_channel(self) -> None:
         opts = None
@@ -956,6 +1040,15 @@ class Streamer:
         log(f"webrtc: local offer set — {sdp_summary(text)}")
         # THREAD BOUNDARY 1: GStreamer thread -> asyncio (WebSocket send).
         self.send_json({"type": "offer", "sdp": text})
+        # Unsolicited config snapshot right behind the offer: a client that just
+        # connected learns the effective bitrate/fps/abr without having to ask,
+        # and can render its controls at the real values instead of guessing.
+        snapshot = self.config_snapshot
+        if snapshot is not None:
+            try:
+                self.send_json(snapshot())
+            except Exception as exc:      # a status frame is never worth a fault
+                warn(f"config: could not announce settings ({exc!r})")
 
     def _on_ice_candidate(self, _element, mline_index, candidate) -> None:
         # THREAD BOUNDARY 1 (again): GStreamer thread -> asyncio.
@@ -1076,6 +1169,7 @@ class Streamer:
                 self.pipeline.set_state(Gst.State.NULL)
                 self.pipeline = None
             self.webrtc = None
+            self.venc = None
             if self.capture is not None:
                 self.capture.stop()
                 self.capture = None
@@ -1911,6 +2005,13 @@ class HubConnector:
 class Daemon:
     """Owns the single-client policy and both event loops' handoffs."""
 
+    # Hard limits for the client-driven config channel. The client is a phone on
+    # the other side of a VPN, not a trusted peer: everything it sends is
+    # clamped into a range this daemon can actually serve, and anything that is
+    # not a number in the first place is dropped.
+    CONFIG_BITRATE_MIN, CONFIG_BITRATE_MAX = 500, 50000        # kbps
+    CONFIG_FPS_MIN, CONFIG_FPS_MAX = 15, 120
+
     def __init__(self, args, injector, on_fatal, hub=None):
         self.args = args
         self.injector = injector
@@ -1924,6 +2025,8 @@ class Daemon:
         # ceiling so a session that has not sampled yet still reads sanely.
         self._abr_kbps = args.bitrate
         self._rtt_ms = None
+        self._bad_config_fields = set()   # log each junk field once per session
+        self.streamer.config_snapshot = self.config_state
 
     # -- hub status ---------------------------------------------------------
     def _on_abr(self, kbps: int, rtt_ms) -> None:
@@ -2001,6 +2104,7 @@ class Daemon:
             # RTT or throttled bitrate against this one.
             self._abr_kbps = self.args.bitrate
             self._rtt_ms = None
+            self._bad_config_fields.clear()
             log(f"ws: client {peer} connected — building pipeline")
             try:
                 await self.loop.run_in_executor(
@@ -2036,7 +2140,183 @@ class Daemon:
                 self.injector.release_all()
             self._publish_hub()            # back to idle
 
-    async def on_message(self, msg) -> None:
+    # -- config channel -----------------------------------------------------
+    def config_state(self, note=None) -> dict:
+        """The effective settings, as the client should render them.
+
+        Called both from the asyncio loop (replies) and from a GStreamer thread
+        (the unsolicited announce after an offer); it only reads plain ints off
+        `args` and the controller, so there is nothing here to race on.
+        """
+        current = self.streamer.current_bitrate()
+        if current is None:
+            current = self._abr_kbps
+        state = {
+            "type": "config",
+            "bitrate": int(current),          # what is being encoded right now
+            "fps": int(self.args.fps),
+            "abr": not self.args.no_abr,
+            "min_bitrate": int(self.args.min_bitrate),
+            "max_bitrate": int(self.args.bitrate),   # the ceiling / pinned rate
+        }
+        if note:
+            state["note"] = note
+        return state
+
+    def _config_number(self, msg, key, lo, hi):
+        """-> clamped int, or None for 'absent' / 'junk, already complained'."""
+        if key not in msg:
+            return None
+        raw = msg.get(key)
+        if raw is None:
+            return None                       # explicit null = leave alone
+        # bool is an int in Python; "bitrate": true is junk, not 1.
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            self._config_junk(key, raw)
+            return None
+        value = int(raw)
+        clamped = max(lo, min(hi, value))
+        if clamped != value:
+            log(f"config: {key}={value} out of range, clamped to {clamped}")
+        return clamped
+
+    def _config_junk(self, key, raw) -> None:
+        if key in self._bad_config_fields:
+            return                            # once per session, then silence
+        self._bad_config_fields.add(key)
+        warn(f"config: ignoring bad {key!r} from the client ({raw!r})")
+
+    async def on_config(self, ws, msg) -> None:
+        """{"type":"config", bitrate?, fps?, abr?} from the phone.
+
+        Manual control is the point: ABR is the *default*, not the law.  Whatever
+        the client asks for, the reply is always the effective state, so its UI
+        reflects reality rather than its own optimism.
+        """
+        bitrate = self._config_number(msg, "bitrate",
+                                      self.CONFIG_BITRATE_MIN, self.CONFIG_BITRATE_MAX)
+        fps = self._config_number(msg, "fps",
+                                  self.CONFIG_FPS_MIN, self.CONFIG_FPS_MAX)
+        abr = msg.get("abr")
+        if abr is not None and not isinstance(abr, bool):
+            self._config_junk("abr", abr)
+            abr = None
+
+        note = None
+        if bitrate is not None or abr is not None:
+            self._apply_bitrate_config(bitrate, abr)
+        if fps is not None and fps != self.args.fps:
+            note = await self._apply_fps_config(ws, fps)
+
+        self._publish_hub()
+        await self._safe_send(ws, self.config_state(note))
+
+    def _apply_bitrate_config(self, bitrate, abr) -> None:
+        """Bitrate and the abr switch, applied to the live encoder.
+
+        A manual bitrate always moves the *ceiling* (`--bitrate`), not just the
+        instantaneous value: "cap it at 6 Mbps" has to survive the controller's
+        next probe upward, and has to survive into the next session's
+        configure_encoder() too.
+        """
+        st = self.streamer
+        if bitrate is not None:
+            self.args.bitrate = bitrate
+            if self.args.min_bitrate > bitrate:
+                self.args.min_bitrate = bitrate
+
+        if abr is False:
+            # Pin: stop adapting and hold whatever was asked for (or whatever we
+            # happen to be at, if the client only said "stop adapting").
+            target = bitrate
+            if target is None:
+                target = st.current_bitrate() or self.args.bitrate
+                self.args.bitrate = int(target)
+            st.stop_abr()
+            self.args.no_abr = True
+            st.set_bitrate_now(target)
+            self._abr_kbps = int(target)
+            log(f"config: abr off — pinned to {int(target)} kbps")
+            return
+
+        if abr is True and self.args.no_abr:
+            # Resume from where we are, not from slow start: the picture must
+            # not visibly drop just because the user re-armed the controller.
+            resume = st.current_bitrate() or self.args.bitrate
+            self.args.no_abr = False
+            if st.start_abr(start_kbps=resume):
+                log(f"config: abr on — resuming at {int(resume)} kbps, "
+                    f"ceiling {self.args.bitrate} kbps")
+            else:
+                self._abr_kbps = int(resume)
+            return
+
+        # ABR already running (or no client yet): move its ceiling.
+        if bitrate is not None:
+            if st.abr is not None:
+                st.abr.set_ceiling(self.args.bitrate, self.args.min_bitrate)
+                log(f"config: ceiling now {self.args.bitrate} kbps "
+                    f"(floor {self.args.min_bitrate})")
+            elif self.args.no_abr:
+                st.set_bitrate_now(bitrate)
+                self._abr_kbps = bitrate
+                log(f"config: pinned bitrate now {bitrate} kbps")
+            else:
+                self._abr_kbps = bitrate
+
+    async def _apply_fps_config(self, ws, fps: int):
+        """Framerate lives in the wf-recorder command line and the rawvideoparse
+        caps, so it cannot be twiddled on a running pipeline.  Rebuild capture +
+        pipeline and re-offer to the SAME websocket: the client only ever
+        answers, never offers, so a fresh offer is a legal thing to hand it and
+        the session survives without a reconnect.
+
+        Returns a note for the reply, or None when the change went through.
+        """
+        old = self.args.fps
+        self.args.fps = fps
+        if self.client is not ws:
+            return "fps applies to the next session"
+        log(f"config: fps {old} -> {fps}, rebuilding capture + pipeline")
+        if await self._rebuild(ws):
+            return None
+        # Rolling back is worth one try: the client asked for a framerate this
+        # machine cannot capture, and dropping it into a dead session over that
+        # would be a worse answer than "no".
+        err(f"config: fps {fps} would not start — rolling back to {old}")
+        self.args.fps = old
+        if await self._rebuild(ws):
+            return f"fps {fps} failed, still at {old}"
+        err("config: rollback failed too — closing the client so it reconnects")
+        try:
+            await ws.close(code=1011, message=b"pipeline failed")
+        except Exception:
+            pass
+        return f"fps {fps} failed and the pipeline did not recover"
+
+    async def _rebuild(self, ws) -> bool:
+        """Stop and restart the pipeline for the client that is already here."""
+        async with self.gate:
+            if self.client is not ws:
+                return False
+            await self.loop.run_in_executor(None, self.streamer.stop)
+            if self.injector:
+                self.injector.release_all()
+            self._abr_kbps = self.args.bitrate
+            self._rtt_ms = None
+            sender = self._sender(ws)
+            try:
+                # fatal=False: a rebuild that fails is a failed *setting*, and
+                # the caller still gets to roll it back. Only the initial attach
+                # is allowed to take the daemon down.
+                await self.loop.run_in_executor(
+                    None, lambda: self.streamer.start(sender, fatal=False))
+            except StreamError as exc:
+                err(f"config: rebuild failed: {exc}")
+                return False
+        return True
+
+    async def on_message(self, ws, msg) -> None:
         kind = msg.get("type")
         if kind == "answer":
             sdp = msg.get("sdp") or ""
@@ -2049,6 +2329,12 @@ class Daemon:
             index = int(msg.get("sdpMLineIndex") or 0)
             # THREAD BOUNDARY 2 (again).
             GLib.idle_add(self.streamer.apply_ice, index, candidate)
+        elif kind == "config":
+            # Manual control from the phone. Deliberately on the signaling
+            # socket rather than the input datachannel: the client must be able
+            # to set bitrate/fps before (or without) the datachannel ever
+            # opening, and the datachannel stays input-only.
+            await self.on_config(ws, msg)
         else:
             warn(f"ws: unknown message type {kind!r}")
 
@@ -2066,7 +2352,7 @@ class Daemon:
                     except ValueError:
                         warn(f"ws: non-JSON message from {peer}")
                         continue
-                    await self.on_message(payload)
+                    await self.on_message(ws, payload)
                 elif raw.type == WSMsgType.ERROR:
                     err(f"ws: connection error: {ws.exception()}")
         finally:
@@ -2265,8 +2551,10 @@ async def serve(args, glib_loop) -> int:
         loop.add_signal_handler(_sig, on_signal, _sig)
 
     log(f"listening on http://{args.bind}:{args.port}  (client: / , signaling: /ws)")
+    mode = (f"fixed {args.bitrate} kbps" if args.no_abr else
+            f"adaptive {args.min_bitrate}-{args.bitrate} kbps")
     log(f"capturing {args.output} on WAYLAND_DISPLAY={args.wayland_display} "
-        f"at {args.width}x{args.height}@{args.fps}, {args.bitrate} kbps")
+        f"at {args.width}x{args.height}@{args.fps}, {mode}")
 
     # Seed the hub with our initial state (idle), then let it reconnect forever
     # in the background. It never blocks or crashes the streamer if absent.
