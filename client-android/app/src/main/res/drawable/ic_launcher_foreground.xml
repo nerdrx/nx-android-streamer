@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The violet orb, glyph inside the adaptive safe zone (center 54,54, r<=36).
+     Reuses the web/icon.svg orb concept: gradient sphere, upper-left sheen, rim. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- orb body -->
+    <path android:pathData="M54,29a25,25 0 1,0 0.001,0z">
+        <aapt:attr name="android:fillColor">
+            <gradient android:type="linear"
+                android:startX="34" android:startY="34" android:endX="74" android:endY="74">
+                <item android:offset="0.0" android:color="#FFA45CFF" />
+                <item android:offset="0.45" android:color="#FF7700FF" />
+                <item android:offset="1.0" android:color="#FF4A00A8" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- upper-left sheen -->
+    <path android:pathData="M54,29a25,25 0 1,0 0.001,0z">
+        <aapt:attr name="android:fillColor">
+            <gradient android:type="radial"
+                android:centerX="45" android:centerY="42" android:gradientRadius="20">
+                <item android:offset="0.0" android:color="#6BFFFFFF" />
+                <item android:offset="1.0" android:color="#00FFFFFF" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- rim -->
+    <path android:pathData="M54,29a25,25 0 1,0 0.001,0z"
+        android:strokeColor="#59C79BFF"
+        android:strokeWidth="0.8"
+        android:fillColor="#00000000" />
+
+    <!-- the glass: the phone the stream lands on -->
+    <path android:pathData="M50,45h8a2.5,2.5 0 0,1 2.5,2.5v13a2.5,2.5 0 0,1 -2.5,2.5h-8a2.5,2.5 0 0,1 -2.5,-2.5v-13a2.5,2.5 0 0,1 2.5,-2.5z"
+        android:fillColor="#8C0A0A12"
+        android:strokeColor="#D9E8E6F2"
+        android:strokeWidth="1.6" />
+    <path android:pathData="M52.5,60h3"
+        android:strokeColor="#D9E8E6F2"
+        android:strokeWidth="1.4"
+        android:strokeLineCap="round" />
+</vector>

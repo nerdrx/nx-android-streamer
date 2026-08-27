@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Nothing sensitive to back up: only the server host/port live in prefs, and a
+     fresh install should just ask again. Exclude everything. -->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="sharedpref" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="sharedpref" />
+    </device-transfer>
+</data-extraction-rules>

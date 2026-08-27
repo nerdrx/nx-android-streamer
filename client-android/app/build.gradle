@@ -1,0 +1,82 @@
+apply plugin: 'com.android.application'
+apply plugin: 'org.jetbrains.kotlin.android'
+
+android {
+    namespace 'dev.nerdrx.nxandroidstreamer'
+    compileSdk 35
+
+    defaultConfig {
+        // The hub manifest (nx-app.json) pins this packageId; it installs the APK
+        // over adb, keyed on exactly this id.
+        applicationId "dev.nerdrx.nxandroidstreamer"
+        // Tensor G2 Pixel 7 ships API 33; minSdk 29 keeps the client broadly usable
+        // on anything the private VPN might reach without giving up anything we need.
+        minSdk 29
+        targetSdk 35
+        versionCode 2
+        versionName "0.2.0"
+    }
+
+    // No real upload key yet. The release build is signed with the debug key so
+    // `assembleRelease` still yields an installable APK, and the hub's adb install
+    // accepts debug-signed packages.
+    // TODO(v0.3): generate a real upload keystore and a `release` signingConfig,
+    //             then flip minify/shrink on and drop this debug-signing shim.
+    buildTypes {
+        release {
+            minifyEnabled false
+            shrinkResources false
+            signingConfig signingConfigs.debug
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+        debug {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+
+    // The About screen prints versionName; AGP 8 no longer generates BuildConfig by default.
+    buildFeatures {
+        buildConfig true
+    }
+
+    packagingOptions {
+        // libwebrtc ships its own JNI .so per ABI; nothing to exclude, but keep
+        // license duplicates from failing the merge.
+        resources {
+            excludes += ['META-INF/*.kotlin_module', 'META-INF/AL2.0', 'META-INF/LGPL2.1']
+        }
+    }
+
+    lint {
+        abortOnError false
+    }
+}
+
+dependencies {
+    // Maintained prebuilt libwebrtc for Android — org.webrtc.* (PeerConnectionFactory,
+    // PeerConnection, SurfaceViewRenderer, EglBase, HardwareVideoDecoderFactory).
+    // Hardware MediaCodec H.264 decode on Tensor G2 comes from HardwareVideoDecoderFactory.
+    implementation 'io.github.webrtc-sdk:android:125.6422.07'
+
+    // WebSocket signaling client. The web client uses the browser WebSocket; native
+    // has none built in, so OkHttp carries the ws:// signaling channel.
+    implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+
+    // WindowInsetsControllerCompat (sticky immersive) + ktx conveniences.
+    implementation 'androidx.core:core-ktx:1.13.1'
+    // AppCompat: ZXing's CaptureActivity theme + our overlay chrome sit on it.
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+
+    // QR pairing: offline-capable embedded scanner. Only needs CAMERA at runtime.
+    // Primary path for across-Tailscale pairing where mDNS cannot cross the tailnet.
+    implementation 'com.journeyapps:zxing-android-embedded:4.3.0'
+}

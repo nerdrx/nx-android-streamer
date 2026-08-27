@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- AppCompat (dark) base: AppCompatActivity + ZXing's CaptureActivity need it.
+         The UI itself is hand-drawn NX glass; immersive fullscreen is driven from code. -->
+    <style name="Theme.NXStreamer" parent="Theme.AppCompat.NoActionBar">
+        <item name="android:windowBackground">@color/nx_void</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
+        <item name="colorAccent">@color/nx_accent</item>
+    </style>
+</resources>

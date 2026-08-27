@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- NX design language: deep space void, one violet accent. Matches the web client
+     (web/style.css): #0a0a12 void, #7700FF accent. -->
+<resources>
+    <color name="nx_void">#0A0A12</color>
+    <color name="nx_accent">#7700FF</color>
+    <color name="nx_accent_soft">#A45CFF</color>
+    <color name="nx_text">#E8E6F2</color>
+    <color name="nx_text_dim">#9C98B4</color>
+    <color name="nx_panel">#141222</color>
+    <color name="nx_line">#2A2340</color>
+</resources>

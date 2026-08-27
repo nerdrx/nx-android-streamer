@@ -1,0 +1,12 @@
+# Build output
+build/
+.gradle/
+.kotlin/
+
+# Local machine + secrets - never committed
+local.properties
+
+# Editors
+.idea/
+*.iml
+.DS_Store
