@@ -7,6 +7,9 @@ set -euo pipefail
 W=${NXAS_WIDTH:-1080}
 H=${NXAS_HEIGHT:-2400}
 HZ=${NXAS_HZ:-90}
+# Waydroid defaults to 180dpi, which on a 1080x2400 panel renders every control
+# at tablet scale — tiny and hard to hit on a real phone. A Pixel 7 is ~420.
+DPI=${NXAS_DPI:-420}
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Repo-local scratch (clones, logs) vs machine-wide session state. The state
@@ -74,6 +77,7 @@ cmd_setup() {
     log "pinning phone geometry ${W}x${H} in waydroid_base.prop..."
     for kv in "persist.waydroid.width=$W" \
               "persist.waydroid.height=$H" \
+              "ro.sf.lcd_density=$DPI" \
               "persist.waydroid.multi_windows=false"; do
         key=${kv%%=*}
         if sudo grep -q "^${key}=" "$PROP" 2>/dev/null; then
@@ -299,6 +303,14 @@ cmd_doctor() {
         "ping -c1 -W2 $gw >/dev/null 2>&1 && echo '  bridge: OK' || echo '  bridge: FAIL'
          ping -c1 -W2 1.1.1.1 >/dev/null 2>&1 && echo '  wan:    OK' || echo '  wan:    FAIL (host may need masquerade for 192.168.240.0/24)'
          ping -c1 -W2 google.com >/dev/null 2>&1 && echo '  dns:    OK' || echo '  dns:    FAIL'" || true
+
+    # Density: waydroid's 180dpi default makes every control tablet-sized (tiny
+    # and unhittable on a phone). Apply live; setup writes it permanently.
+    if adb devices 2>/dev/null | grep -q "5555[[:space:]]*device"; then
+        local dev; dev=$(adb devices | awk '/5555[[:space:]]*device/{print $1; exit}')
+        adb -s "$dev" shell wm density "$DPI" >/dev/null 2>&1 \
+            && log "density set to ${DPI}dpi ✓" || true
+    fi
 
     log "authorizing host adb key + enabling adbd on tcp/5555..."
     [[ -f $HOME/.android/adbkey.pub ]] || { log "  generating adb key..."; adb keygen "$HOME/.android/adbkey" >/dev/null 2>&1 || true; adb start-server >/dev/null 2>&1 || true; }

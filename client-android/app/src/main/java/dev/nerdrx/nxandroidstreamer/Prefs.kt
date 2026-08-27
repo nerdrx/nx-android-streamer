@@ -69,7 +69,9 @@ class Prefs(context: Context) {
     // ---- display --------------------------------------------------------
 
     var scaling: Scaling
-        get() = if (sp.getString(KEY_SCALING, "FIT") == "FILL") Scaling.FILL else Scaling.FIT
+        // FILL by default: the remote is the same 1080x2400 as the phone, so "fill"
+        // is an exact 1:1 with nothing cropped, while FIT letterboxes it smaller.
+        get() = if (sp.getString(KEY_SCALING, "FILL") == "FILL") Scaling.FILL else Scaling.FIT
         set(v) = sp.edit().putString(KEY_SCALING, v.name).apply()
 
     var pillMode: PillMode
