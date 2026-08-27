@@ -1358,14 +1358,26 @@ class Streamer:
         text = offer.sdp.as_text()
         log(f"webrtc: local offer set — {sdp_summary(text)}")
         # THREAD BOUNDARY 1: GStreamer thread -> asyncio (WebSocket send).
-        self.send_json({"type": "offer", "sdp": text})
+        # Guarded like _on_ice_candidate: a client that leaves between
+        # create-offer and this callback leaves send_json None, and an unhandled
+        # TypeError here lands on the GLib thread mid-negotiation — exactly the
+        # window where teardown races used to abort the whole process.
+        send = self.send_json
+        if send is None:
+            dbg("webrtc: offer dropped, client already gone")
+            return
+        try:
+            send({"type": "offer", "sdp": text})
+        except Exception as exc:
+            warn(f"webrtc: could not deliver offer ({exc!r})")
+            return
         # Unsolicited config snapshot right behind the offer: a client that just
         # connected learns the effective bitrate/fps/abr without having to ask,
         # and can render its controls at the real values instead of guessing.
         snapshot = self.config_snapshot
         if snapshot is not None:
             try:
-                self.send_json(snapshot())
+                send(snapshot())
             except Exception as exc:      # a status frame is never worth a fault
                 warn(f"config: could not announce settings ({exc!r})")
 
