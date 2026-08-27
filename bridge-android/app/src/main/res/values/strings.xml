@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">NX Bridge</string>
+    <!-- What the remote Android's picker chooser shows next to our icon. -->
+    <string name="picker_label">Pick on my phone</string>
+</resources>

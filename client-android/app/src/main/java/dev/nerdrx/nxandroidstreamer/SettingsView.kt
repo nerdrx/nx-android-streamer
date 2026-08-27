@@ -39,6 +39,13 @@ class SettingsView(context: Context, private val host: Host) : ScrollView(contex
         fun onSettingsChanged()
         /** Push bitrate/fps/abr to the server for the live session. */
         fun onQualityChanged()
+
+        // nx-bridge: the remote-camera opt-in and whatever the server last said
+        // about it.
+        fun onCameraAllowChanged(allow: Boolean)
+        fun cameraStatus(): String?
+        /** The battery-mirror toggle flipped; start or stop it on the live session. */
+        fun onBatteryMirrorChanged()
     }
 
     private val col = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
@@ -136,6 +143,7 @@ class SettingsView(context: Context, private val host: Host) : ScrollView(contex
         renderDisplaySection()
         renderQualitySection()
         renderBehaviorSection()
+        renderHardwareSection()
         renderAboutSection()
     }
 
@@ -351,6 +359,35 @@ class SettingsView(context: Context, private val host: Host) : ScrollView(contex
         col.addView(toggleRow(ctx, "Auto-connect to last server on launch", prefs.autoConnect) { prefs.autoConnect = it })
         col.addView(toggleRow(ctx, "Reconnect automatically", prefs.autoReconnect) { prefs.autoReconnect = it })
         col.addView(toggleRow(ctx, "Haptic tick on connect", prefs.hapticOnConnect) { prefs.hapticOnConnect = it })
+        col.addView(toggleRow(ctx, "Mirror my battery to the remote", prefs.mirrorBattery) {
+            prefs.mirrorBattery = it
+            host.onBatteryMirrorChanged()
+        })
+    }
+
+    /**
+     * Reverse streams: the phone's own hardware, offered to the remote Android.
+     *
+     * Its own section rather than a line in "Input & behaviour" because it is
+     * the one setting here that gives the machine on the other end of the VPN
+     * something it could not otherwise have. Default OFF, and the row always
+     * says what the server currently thinks, so "allowed" and "actually
+     * streaming" are never confused for each other.
+     */
+    private fun renderHardwareSection() {
+        val ctx = context
+        val prefs = host.prefs
+        col.addView(Ui.sectionHeader(ctx, "Phone hardware"))
+        col.addView(toggleRow(ctx, "Allow remote camera access", prefs.allowRemoteCamera) {
+            prefs.allowRemoteCamera = it
+            host.onCameraAllowChanged(it)
+            render()
+        })
+        val note = host.cameraStatus()
+            ?: if (prefs.allowRemoteCamera)
+                "The host will ask when an app in the remote Android wants a camera."
+            else "Apps in the remote Android cannot see this phone's camera."
+        col.addView(Ui.body(ctx, note, NxColor.DIM, 12f))
     }
 
     private fun renderAboutSection() {

@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Only the one directory we hand files out of. The spool itself is never
+     exposed: a delivered file is copied into files/shared/ first, so a caller
+     holding the Uri can never see (or race) the next transfer. -->
+<paths>
+    <files-path name="nx-shared" path="shared/" />
+</paths>

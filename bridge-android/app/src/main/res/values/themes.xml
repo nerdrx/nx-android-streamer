@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Plain framework Material dark, not AppCompat: this app pulls in no
+         AppCompat dependency and its two screens are hand-drawn NX glass. -->
+    <style name="Theme.NXBridge" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/nx_void</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:colorAccent">@color/nx_accent</item>
+    </style>
+</resources>

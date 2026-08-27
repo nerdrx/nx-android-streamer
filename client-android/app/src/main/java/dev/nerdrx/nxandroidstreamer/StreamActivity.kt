@@ -3,6 +3,7 @@ package dev.nerdrx.nxandroidstreamer
 import android.Manifest
 import android.content.pm.PackageManager
 import android.graphics.drawable.GradientDrawable
+import android.media.AudioAttributes
 import android.net.ConnectivityManager
 import android.net.Network
 import android.os.Build
@@ -27,10 +28,13 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
+import org.json.JSONObject
 import org.webrtc.DefaultVideoEncoderFactory
 import org.webrtc.EglBase
 import org.webrtc.DefaultVideoDecoderFactory
+import org.webrtc.PeerConnection
 import org.webrtc.PeerConnectionFactory
+import org.webrtc.audio.JavaAudioDeviceModule
 
 /**
  * The single activity. Portrait-locked, sticky-immersive, the video is the app.
@@ -47,6 +51,8 @@ class StreamActivity : AppCompatActivity(), StreamClient.Listener, StreamView.Ca
     private lateinit var prefsImpl: Prefs
     private lateinit var eglBase: EglBase
     private lateinit var factory: PeerConnectionFactory
+    private lateinit var audioModule: JavaAudioDeviceModule
+    private lateinit var battery: BatteryMonitor
 
     private lateinit var root: FrameLayout
     private lateinit var streamView: StreamView
@@ -55,6 +61,12 @@ class StreamActivity : AppCompatActivity(), StreamClient.Listener, StreamView.Ca
 
     private var settingsView: SettingsView? = null
     private var client: StreamClient? = null
+
+    // nx-bridge: the two reverse bridges. Both own ActivityResultLaunchers, so
+    // both are built in onCreate() and never later — registration after the
+    // activity is STARTED throws.
+    private lateinit var pickerBridge: PickerBridge
+    private lateinit var cameraBridge: CameraBridge
 
     private lateinit var discovery: Discovery
     private var discovered: List<Discovery.Server> = emptyList()
@@ -111,11 +123,45 @@ class StreamActivity : AppCompatActivity(), StreamClient.Listener, StreamView.Ca
                 .createInitializationOptions()
         )
         eglBase = EglBase.create()
+        // Audio needs no code of ours to play: libwebrtc decodes an incoming
+        // Opus track and hands it to the device module by itself. What it does
+        // need is the right output — the default module opens the track as
+        // VOICE_COMMUNICATION, which is the earpiece-and-echo-canceller path
+        // meant for calls, not for a phone's whole sound output. USAGE_MEDIA
+        // puts the remote Android on the media stream, where the volume keys
+        // and the loudspeaker already are. Inert while the server runs
+        // --audio none: no audio track is negotiated, so nothing opens.
+        audioModule = JavaAudioDeviceModule.builder(applicationContext)
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
+                    .build()
+            )
+            // We never send audio upstream, so nothing here should reach for
+            // the mic (and nothing should want RECORD_AUDIO).
+            .setUseHardwareAcousticEchoCanceler(false)
+            .setUseHardwareNoiseSuppressor(false)
+            .createAudioDeviceModule()
         factory = PeerConnectionFactory.builder()
+            .setAudioDeviceModule(audioModule)
             .setVideoDecoderFactory(DefaultVideoDecoderFactory(eglBase.eglBaseContext))
             .setVideoEncoderFactory(DefaultVideoEncoderFactory(eglBase.eglBaseContext, true, true))
             .setOptions(PeerConnectionFactory.Options())
             .createPeerConnectionFactory()
+
+        // No permission needed, and nothing is registered until a stream is up.
+        battery = BatteryMonitor(applicationContext) { level, charging ->
+            client?.sendBattery(level, charging)
+        }
+
+        // nx-bridge: on-demand picker + the phone-camera upstream. Neither does
+        // anything until the server asks; the camera additionally needs the
+        // opt-in in Settings, which is off by default.
+        pickerBridge = PickerBridge(this) { client }
+        cameraBridge = CameraBridge(this, factory, eglBase, prefsImpl, { client }) {
+            settingsView?.refresh()          // the status line under the toggle
+        }
 
         buildUi()
         enterImmersive()
@@ -278,9 +324,18 @@ class StreamActivity : AppCompatActivity(), StreamClient.Listener, StreamView.Ca
             it.sendConfig(prefsImpl.bitrateKbps, prefsImpl.fps, prefsImpl.adaptiveBitrate)
             it.start()
         }
+        // After the client exists, so the first reading has somewhere to go —
+        // it rides along on the websocket's open, like the quality config.
+        applyBatteryMirror()
     }
 
     private fun stopStream() {
+        // nx-bridge: let the container stop waiting on a pick, and put the
+        // camera down before the socket goes.
+        pickerBridge.abort()
+        cameraBridge.onSessionEnded()
+        battery.stop()
+        client?.sendBatteryOff()
         client?.stop()
         client = null
         connectedProfile = null
@@ -300,8 +355,19 @@ class StreamActivity : AppCompatActivity(), StreamClient.Listener, StreamView.Ca
         lastPhase = phase
         when (phase) {
             StreamClient.Phase.CONNECTING -> setWaitingPill("connecting…")
-            StreamClient.Phase.RECONNECTING -> setWaitingPill("reconnecting…")
-            StreamClient.Phase.DISCONNECTED -> setWaitingPill("disconnected")
+            // nx-bridge: the socket is gone, so an in-flight upload can never
+            // finish and the camera should not stay held over a reconnect the
+            // user may never complete. Both calls are no-ops when idle.
+            StreamClient.Phase.RECONNECTING -> {
+                setWaitingPill("reconnecting…")
+                pickerBridge.abort()
+                cameraBridge.onSessionEnded()
+            }
+            StreamClient.Phase.DISCONNECTED -> {
+                setWaitingPill("disconnected")
+                pickerBridge.abort()
+                cameraBridge.onSessionEnded()
+            }
             StreamClient.Phase.LIVE -> {
                 if (was != StreamClient.Phase.LIVE) {
                     if (prefsImpl.hapticOnConnect) haptic()
@@ -320,6 +386,23 @@ class StreamActivity : AppCompatActivity(), StreamClient.Listener, StreamView.Ca
             setPillText(rttMs?.let { "$it ms" } ?: "live")
         }
         settingsView?.updateDiagnostics()
+    }
+
+    // ---- nx-bridge seams -----------------------------------------------
+
+    /** Signaling frames StreamClient does not own: route them to their bridge. */
+    override fun onServerMessage(msg: JSONObject) {
+        when (msg.optString("type")) {
+            "pick" -> pickerBridge.onPickRequest(msg)
+            "camera" -> cameraBridge.onCameraMessage(msg)
+            "pick-error" -> toast("The host could not take the file")
+        }
+    }
+
+    /** Offer applied, answer not yet built — the camera bridge's one chance to
+     *  claim the recvonly m=video the daemon put there for it. */
+    override fun onRemoteOfferApplied(pc: PeerConnection, sdp: String) {
+        cameraBridge.prepare(pc, sdp)
     }
 
     // ---- StreamView.Callbacks ------------------------------------------
@@ -363,6 +446,27 @@ class StreamActivity : AppCompatActivity(), StreamClient.Listener, StreamView.Ca
     override fun onQualityChanged() {
         // Apply live to the running session; StreamClient re-sends on reconnect.
         client?.sendConfig(prefsImpl.bitrateKbps, prefsImpl.fps, prefsImpl.adaptiveBitrate)
+    }
+
+    // nx-bridge: the remote-camera opt-in. The server is told whether it *may*
+    // ask; it answers with whether it is asking, and only then do we capture.
+    override fun onCameraAllowChanged(allow: Boolean) = cameraBridge.onAllowChanged(allow)
+    override fun cameraStatus(): String? = cameraBridge.statusText()
+
+    override fun onBatteryMirrorChanged() = applyBatteryMirror()
+
+    /**
+     * Match the monitor to the setting and the session. Switching mirroring off
+     * has to be said out loud: the server's `dumpsys battery` override outlives
+     * both the socket and this process, so "stop sending" is not enough.
+     */
+    private fun applyBatteryMirror() {
+        if (client != null && prefsImpl.mirrorBattery) {
+            battery.start()
+        } else {
+            battery.stop()
+            client?.sendBatteryOff()
+        }
     }
 
     override fun onSettingsChanged() {
@@ -582,12 +686,15 @@ class StreamActivity : AppCompatActivity(), StreamClient.Listener, StreamView.Ca
         netCallback?.let {
             try { (getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager).unregisterNetworkCallback(it) } catch (_: Exception) {}
         }
+        battery.stop()
+        cameraBridge.release()          // nx-bridge: hand the camera back
         client?.stop()
         client = null
         stopDiscovery()
         releaseWake()
         streamView.release()
         try { factory.dispose() } catch (_: Exception) {}
+        try { audioModule.release() } catch (_: Exception) {}
         try { eglBase.release() } catch (_: Exception) {}
     }
 }

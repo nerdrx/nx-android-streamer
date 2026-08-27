@@ -66,6 +66,15 @@ class Prefs(context: Context) {
         get() = sp.getBoolean(KEY_HAPTIC, true)
         set(v) = sp.edit().putBoolean(KEY_HAPTIC, v).apply()
 
+    /**
+     * Push this phone's battery level and charging state onto the remote
+     * Android. On by default: the whole point of the remote is that it feels
+     * like the same device, and the status bar is the first place that shows.
+     */
+    var mirrorBattery: Boolean
+        get() = sp.getBoolean(KEY_MIRROR_BATTERY, true)
+        set(v) = sp.edit().putBoolean(KEY_MIRROR_BATTERY, v).apply()
+
     // ---- display --------------------------------------------------------
 
     var scaling: Scaling
@@ -85,6 +94,19 @@ class Prefs(context: Context) {
     var keepAwake: Boolean
         get() = sp.getBoolean(KEY_KEEP_AWAKE, true)
         set(v) = sp.edit().putBoolean(KEY_KEEP_AWAKE, v).apply()
+
+    // ---- remote hardware ------------------------------------------------
+
+    /**
+     * May the remote Android use this phone's camera? Default OFF and it stays
+     * off across upgrades: handing a machine on the other end of a VPN a live
+     * camera is the single most invasive thing this app can do, so it is opt-in
+     * every time, never a migration default. The server only ever *asks*; this
+     * flag is the answer.
+     */
+    var allowRemoteCamera: Boolean
+        get() = sp.getBoolean(KEY_ALLOW_CAMERA, false)
+        set(v) = sp.edit().putBoolean(KEY_ALLOW_CAMERA, v).apply()
 
     // ---- stream quality (sent to the server as a config message) --------
     // The server is authoritative and clamps these; we only remember what the
@@ -116,5 +138,7 @@ class Prefs(context: Context) {
         private const val KEY_SCALING = "scaling"
         private const val KEY_PILL = "pill_mode"
         private const val KEY_KEEP_AWAKE = "keep_awake"
+        private const val KEY_ALLOW_CAMERA = "allow_remote_camera"
+        private const val KEY_MIRROR_BATTERY = "mirror_battery"
     }
 }

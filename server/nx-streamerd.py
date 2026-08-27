@@ -56,6 +56,11 @@ except (ValueError, ImportError):       # pragma: no cover - packaging variance
 import aiohttp  # noqa: E402
 from aiohttp import WSMsgType, web  # noqa: E402
 
+# The picker + camera bridges. Self-contained on purpose: this daemon holds them
+# with six one-line hooks (arguments, camera receiver, attach, detach, message
+# dispatch) and streams exactly the same without the module.
+import nx_bridge  # noqa: E402
+
 # ------------------------------------------------------------------- log ----
 
 _PURPLE = "\033[38;2;119;0;255m"
@@ -267,6 +272,254 @@ class Capture:
             pass
         except OSError as exc:
             warn(f"capture: could not remove {self.fifo}: {exc}")
+
+
+# ----------------------------------------------------------------- audio ----
+
+PACTL = "pactl"
+
+
+class AudioRoute:
+    """Where the container's audio can actually be picked up.
+
+    Waydroid has no sink of its own.  Its HAL (`audio.primary.waydroid.so`) is
+    plain ALSA — libasound with `PULSE_RUNTIME_PATH=/run/xdg/pulse`, a bind
+    mount of the host's PulseAudio socket — so Android arrives on the host as
+    one ordinary playback stream called "Waydroid", mixed into whatever the
+    default sink happens to be, alongside the browser and the chat client and
+    everything else.  There is therefore **no monitor source that means
+    "Waydroid and only Waydroid"**, and capturing the default sink's monitor
+    would ship the user's entire desktop audio to their phone.
+
+    So `--audio auto` makes one: a private null sink whose monitor carries the
+    container and nothing else.  We never touch the default sink, the default
+    source, or any stream that is not Waydroid's, we re-home streams that show
+    up later (Android opens and closes the PCM as apps come and go), and
+    everything we moved goes back where it came from on the way out.
+
+    `--audio <source-name>` skips all of that and captures the named source
+    verbatim, for a rig that already routes Waydroid somewhere deliberate.
+
+    Everything here is best-effort by construction: audio that cannot be set up
+    is a video-only session, never a failed one.
+    """
+
+    SINK_NAME = "nxas_waydroid"
+    SINK_DESC = "NX_Android_Streamer"     # no spaces: PA splits module args on them
+    STREAM_MATCH = "waydroid"             # matched case-insensitively
+    POLL_INTERVAL = 2.0
+    TIMEOUT = 10.0
+
+    def __init__(self, spec: str):
+        self.spec = (spec or "none").strip()
+        self.source = None                # what the pipeline should capture
+        self._module = None               # our null-sink module id, if we own one
+        self._sink_index = None           # our sink's index, as sink-inputs report it
+        self._origin = {}                 # sink-input index -> the sink it came from
+
+    # -- pactl --------------------------------------------------------------
+    @classmethod
+    def _pactl(cls, *argv, check=True):
+        """-> stdout, or None when pactl is missing/failed.
+
+        LC_ALL=C is load-bearing: `pactl list` is translated, and parsing
+        "Senkeingang #12" for "Sink Input #12" is exactly the kind of bug that
+        only shows up on somebody else's machine.
+        """
+        env = os.environ.copy()
+        env["LC_ALL"] = "C"
+        try:
+            out = subprocess.run([PACTL, *argv], stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, timeout=cls.TIMEOUT,
+                                 env=env)
+        except FileNotFoundError:
+            return None
+        except (OSError, subprocess.SubprocessError) as exc:
+            dbg(f"audio: pactl {' '.join(argv[:2])} failed ({exc!r})")
+            return None
+        if check and out.returncode != 0:
+            dbg(f"audio: pactl {' '.join(argv[:2])} rc={out.returncode}: "
+                f"{out.stderr.decode('utf-8', 'replace').strip()}")
+            return None
+        return out.stdout.decode("utf-8", "replace")
+
+    @classmethod
+    def _sources(cls):
+        text = cls._pactl("list", "short", "sources")
+        if text is None:
+            return []
+        return [line.split("\t")[1] for line in text.splitlines()
+                if len(line.split("\t")) > 1]
+
+    @classmethod
+    def _sink_inputs(cls):
+        """-> [(index, sink_index, name)] for every playback stream.
+
+        `pactl list short sink-inputs` gives indices but not application names,
+        so the long form is the only way to tell Waydroid's stream apart.
+        """
+        text = cls._pactl("list", "sink-inputs")
+        if text is None:
+            return []
+        found, index, sink, name = [], None, None, ""
+        for raw in text.splitlines():
+            line = raw.strip()
+            if line.startswith("Sink Input #"):
+                if index is not None:
+                    found.append((index, sink, name))
+                index, sink, name = line[12:].strip(), None, ""
+            elif line.startswith("Sink:"):
+                sink = line.split(":", 1)[1].strip()
+            elif line.startswith(("application.name = ", "node.name = ")):
+                # Waydroid sets both to "Waydroid"; either will do, and taking
+                # the first non-empty one keeps us working if one goes away.
+                if not name:
+                    name = line.split("=", 1)[1].strip().strip('"')
+        if index is not None:
+            found.append((index, sink, name))
+        return found
+
+    @classmethod
+    def _sink_index_of(cls, name):
+        """-> the index PulseAudio gives our sink, as a string, or None.
+        sink-inputs name their sink by index, so this is what poll() compares."""
+        text = cls._pactl("list", "short", "sinks")
+        if text is None:
+            return None
+        for line in text.splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 2 and parts[1] == name:
+                return parts[0]
+        return None
+
+    @classmethod
+    def _our_module(cls):
+        """-> the module id of an existing nxas null sink, or None.
+
+        `pactl list short modules` is index<TAB>name<TAB>argument, so the sink
+        we own is the module-null-sink whose argument names our sink.
+        """
+        text = cls._pactl("list", "short", "modules")
+        if text is None:
+            return None
+        for line in text.splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 3 and parts[1] == "module-null-sink" \
+                    and f"sink_name={cls.SINK_NAME}" in parts[2]:
+                return parts[0]
+        return None
+
+    # -- lifecycle ----------------------------------------------------------
+    def resolve(self):
+        """Set up (if needed) and return the source name to capture, or None.
+
+        Called once at startup, before any client can connect, so the source
+        exists for the very first offer — negotiating an audio transceiver
+        against a source that only appears when Android happens to be playing
+        would be a coin flip.
+        """
+        if self.spec in ("", "none"):
+            return None
+        if self._pactl("info") is None:
+            err(f"audio: --audio {self.spec} needs a working 'pactl' and there "
+                "is none — streaming video only")
+            return None
+        if self.spec != "auto":
+            if self.spec not in self._sources():
+                err(f"audio: source {self.spec!r} does not exist "
+                    "(pactl list short sources) — streaming video only")
+                return None
+            self.source = self.spec
+            log(f"audio: capturing {self.source}")
+            return self.source
+        return self._auto()
+
+    def _auto(self):
+        monitor = f"{self.SINK_NAME}.monitor"
+        if monitor in self._sources():
+            # Left over from a daemon that was killed before release() ran.
+            # Adopt it — module id and all — rather than stacking a second
+            # identical sink on top of it and leaking both.
+            self._module = self._our_module()
+            if self._module is None:
+                warn(f"audio: adopting the leftover {self.SINK_NAME} sink, but "
+                     "its module id is unknown — it will not be removed on exit")
+            else:
+                warn(f"audio: adopting the leftover {self.SINK_NAME} sink "
+                     f"(module {self._module})")
+        else:
+            out = self._pactl("load-module", "module-null-sink",
+                              f"sink_name={self.SINK_NAME}",
+                              f"sink_properties=device.description={self.SINK_DESC}")
+            if out is None:
+                err("audio: could not create the private Waydroid sink — "
+                    "streaming video only")
+                return None
+            self._module = out.strip().split()[-1] if out.strip() else None
+            if monitor not in self._sources():
+                err(f"audio: {monitor} did not appear after load-module — "
+                    "streaming video only")
+                self.release()
+                return None
+        self.source = monitor
+        self._sink_index = self._sink_index_of(self.SINK_NAME)
+        log(f"audio: private sink {self.SINK_NAME} up; capturing {monitor}")
+        self.poll()
+        return self.source
+
+    def poll(self) -> None:
+        """Re-home any Waydroid stream that is not in our sink yet.
+
+        Android opens and closes the PCM as apps start and stop, so a stream
+        that did not exist at startup will land on the default sink like any
+        other; this is what catches it.  Cheap enough to run on a timer, and a
+        no-op the rest of the time.
+        """
+        if self.spec != "auto" or self.source is None:
+            return
+        if self._sink_index is None:
+            self._sink_index = self._sink_index_of(self.SINK_NAME)
+            if self._sink_index is None:
+                return
+        live = set()
+        for index, sink, name in self._sink_inputs():
+            live.add(index)
+            if self.STREAM_MATCH not in name.lower():
+                continue
+            if sink == self._sink_index:
+                continue                    # already ours
+            # Deliberately keyed on where the stream *is*, not on whether we
+            # once moved it: `pactl move-sink-input` reports success as soon as
+            # the request is accepted, so a move that did not take gets retried
+            # on the next tick instead of being remembered as done.
+            if self._pactl("move-sink-input", index, self.SINK_NAME) is None:
+                warn(f"audio: could not move stream {index} ({name}) into "
+                     f"{self.SINK_NAME}")
+                continue
+            # setdefault, not assignment: on a retry `sink` is still the real
+            # origin, but we must never overwrite it with our own sink.
+            if self._origin.setdefault(index, sink) == sink:
+                log(f"audio: routed Waydroid stream {index} -> {self.SINK_NAME}")
+        # Forget streams that ended; their index will be reused by somebody else.
+        for index in [i for i in self._origin if i not in live]:
+            self._origin.pop(index, None)
+
+    def release(self) -> None:
+        """Put the graph back exactly as we found it.  Idempotent."""
+        for index, sink in list(self._origin.items()):
+            if sink:
+                self._pactl("move-sink-input", index, sink, check=False)
+        self._origin.clear()
+        if self._module is not None:
+            if self._pactl("unload-module", self._module) is None:
+                warn(f"audio: could not unload module {self._module} — "
+                     f"'pactl unload-module {self._module}' removes the leftover "
+                     f"{self.SINK_NAME} sink")
+            else:
+                log(f"audio: private sink {self.SINK_NAME} removed")
+            self._module = None
+        self._sink_index = None
+        self.source = None
 
 
 # --------------------------------------------------------------- encoder ----
@@ -825,6 +1078,41 @@ class Streamer:
             f"! rtph264pay name=pay pt=96 mtu=1100 "
             f"! application/x-rtp,media=video,encoding-name=H264,payload=96 "
             f"! webrtcbin name=webrtc bundle-policy=max-compat"
+            + self._audio_branch()
+        )
+
+    def _audio_branch(self) -> str:
+        """A second sendonly transceiver on the SAME webrtcbin, or nothing.
+
+        Gated on --audio, which defaults to none: the video path is the working
+        one and an audio branch must never be able to cost it a negotiation.
+        With no source resolved this returns "" and the launch string is
+        byte-identical to the video-only one.
+
+        provide-clock=false is the subtle bit. Our video comes off a filesrc,
+        which is not a live source, so the pipeline runs on the system clock.
+        pulsesrc *is* live and would otherwise volunteer to be the clock
+        provider — which quietly re-paces the encoder against the sound card.
+        Video timing is not audio's business.
+        """
+        src = getattr(self.args, "audio_source", None)
+        if not src:
+            return ""
+        a = self.args
+        return (
+            f' pulsesrc device="{src}" name=asrc provide-clock=false '
+            # convert/resample first: an explicitly named source may be mono,
+            # 44.1 kHz, or anything else, and opusenc only takes a shortlist.
+            f"! audioconvert ! audioresample "
+            f"! audio/x-raw,rate=48000,channels=2 "
+            # 20 ms frames match what every WebRTC receiver expects; in-band FEC
+            # only actually emits redundancy when the encoder is told to expect
+            # loss, hence the pair.
+            f"! opusenc bitrate={a.audio_bitrate} frame-size=20 "
+            f"inband-fec=true packet-loss-percentage=5 "
+            f"! rtpopuspay pt=97 mtu=1100 "
+            f"! application/x-rtp,media=audio,encoding-name=OPUS,payload=97 "
+            f"! webrtc."
         )
 
     def start(self, send_json, fatal: bool = True) -> None:
@@ -901,6 +1189,13 @@ class Streamer:
 
             self._create_channel()
             self._sendonly_done = self._force_sendonly()
+
+            # nx-bridge hook: optional camera receive path (phone camera ->
+            # v4l2loopback). Adds a recvonly transceiver before the offer exists,
+            # so no renegotiation is ever needed. Returns None — leaving the
+            # pipeline exactly as it was — unless --camera is on AND a loopback
+            # node is there.
+            nx_bridge.attach_camera_receiver(self.args, self.pipeline, self.webrtc)
 
             ret = self.pipeline.set_state(Gst.State.PLAYING)
             log(f"pipeline: -> PLAYING ({ret.value_nick})")
@@ -998,14 +1293,27 @@ class Streamer:
         """webrtcbin creates the transceiver when its sink pad is requested,
         which parse_launch already did — but on some versions it only
         materializes once the element is PLAYING, so this gets a second try
-        just before the offer."""
-        tr = self.webrtc.emit("get-transceiver", 0)
-        if tr is None:
+        just before the offer.
+
+        One per medium we send, in the order parse_launch requested the pads:
+        video is 0, audio (when the audio branch exists) is 1.
+        """
+        wanted = 2 if getattr(self.args, "audio_source", None) else 1
+        done = 0
+        for index in range(wanted):
+            tr = self.webrtc.emit("get-transceiver", index)
+            if tr is None:
+                break
+            tr.set_property("direction",
+                            GstWebRTC.WebRTCRTPTransceiverDirection.SENDONLY)
+            done += 1
+        if done < wanted:
             if not quiet:
-                warn("webrtc: no transceiver at index 0 yet, retrying at offer time")
+                warn(f"webrtc: only {done}/{wanted} transceiver(s) exist yet, "
+                     "retrying at offer time")
             return False
-        tr.set_property("direction", GstWebRTC.WebRTCRTPTransceiverDirection.SENDONLY)
-        log("webrtc: video transceiver direction=sendonly")
+        log(f"webrtc: {done} transceiver(s) direction=sendonly"
+            f"{' (video+audio)' if wanted > 1 else ' (video)'}")
         return True
 
     # -- negotiation (all of this runs on GStreamer/GLib threads) -----------
@@ -1052,8 +1360,17 @@ class Streamer:
 
     def _on_ice_candidate(self, _element, mline_index, candidate) -> None:
         # THREAD BOUNDARY 1 (again): GStreamer thread -> asyncio.
-        self.send_json({"type": "ice", "candidate": candidate,
-                        "sdpMLineIndex": int(mline_index)})
+        # ICE gathering outlives the client: candidates keep arriving for a
+        # moment after a disconnect, when send_json is already gone. That is
+        # routine, not an error worth a traceback in the log.
+        send = self.send_json
+        if send is None:
+            return
+        try:
+            send({"type": "ice", "candidate": candidate,
+                  "sdpMLineIndex": int(mline_index)})
+        except Exception as exc:
+            dbg(f"ice: candidate dropped after teardown ({exc!r})")
 
     # THREAD BOUNDARY 2: asyncio -> GStreamer.  Both of these are only ever
     # called via GLib.idle_add() from the WebSocket handler, so they execute on
@@ -1196,6 +1513,205 @@ class Streamer:
                 self.capture.stop()
                 self.capture = None
             self.send_json = None
+
+
+# ------------------------------------------------------------------- adb ----
+
+class Adb:
+    """One adb target, shared by everything that talks into the container.
+
+    Two things need the same device now — the touch path (ScrcpyInjector) and
+    the battery mirror — and discovering it twice would mean two `adb connect`
+    races against the same Waydroid container, plus two places to keep the
+    "never run adb without an explicit serial" rule in.  So resolution happens
+    exactly once, behind a lock, and every user holds this same object.
+
+    Loop-affine: `run()` and `resolve()` are coroutines on the asyncio loop.
+    """
+
+    LEASES = "/var/lib/misc/dnsmasq.waydroid0.leases"
+
+    def __init__(self, binary, serial=None):
+        self.binary = binary or "adb"
+        self.serial = serial
+        self._resolving = asyncio.Lock()
+
+    async def run(self, *argv, timeout=20.0, check=True):
+        """Every adb call goes through here, and every one of them carries
+        -s <serial>. A bare `adb shell` would happily target whatever phone
+        happens to be plugged into the machine — never do that."""
+        if not self.serial:
+            raise StreamError("refusing to run adb without an explicit serial")
+        cmd = [self.binary, "-s", self.serial, *argv]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            raise StreamError(f"adb {' '.join(argv[:2])} timed out after {timeout}s")
+        text = out.decode("utf-8", "replace").strip()
+        if check and proc.returncode != 0:
+            raise StreamError(f"adb {' '.join(argv[:2])} failed: {text or proc.returncode}")
+        return text
+
+    def waydroid_ip(self):
+        """Waydroid's container IP, cheapest source first."""
+        try:
+            with open(self.LEASES, "r") as fh:
+                for line in fh:
+                    parts = line.split()
+                    if len(parts) >= 3 and parts[2].count(".") == 3:
+                        return parts[2]
+        except OSError:
+            pass
+        try:
+            out = subprocess.run(["waydroid", "status"], stdout=subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL, timeout=10)
+            for line in out.stdout.decode("utf-8", "replace").splitlines():
+                if "IP address" in line:
+                    value = line.split(":", 1)[1].strip()
+                    if value and value != "UNKNOWN":
+                        return value
+        except (OSError, subprocess.SubprocessError):
+            pass
+        try:
+            out = subprocess.run(["ip", "-4", "neigh", "show", "dev", "waydroid0"],
+                                 stdout=subprocess.PIPE, timeout=5)
+            for line in out.stdout.decode().splitlines():
+                if line.split():
+                    return line.split()[0]
+        except (OSError, subprocess.SubprocessError):
+            pass
+        return None
+
+    async def resolve(self) -> None:
+        """Find the container and `adb connect` to it, at most once."""
+        if self.serial:
+            return
+        async with self._resolving:
+            if self.serial:                  # somebody else won the race
+                return
+            ip = self.waydroid_ip()
+            if not ip:
+                raise StreamError(
+                    "cannot find the Waydroid container IP (no DHCP lease in "
+                    f"{self.LEASES}, no 'IP address' from waydroid status). "
+                    "Android may still be booting, or pass --adb-serial "
+                    "explicitly.")
+            target = f"{ip}:5555"
+            proc = await asyncio.create_subprocess_exec(
+                self.binary, "connect", target,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+            out, _ = await asyncio.wait_for(proc.communicate(), 20.0)
+            text = out.decode("utf-8", "replace").strip()
+            if "connected to" not in text:
+                raise StreamError(f"adb connect {target}: {text}")
+            self.serial = target
+            log(f"adb: connected to waydroid at {target} ({text})")
+
+
+# --------------------------------------------------------------- battery ----
+
+class BatteryMirror:
+    """The real phone's battery, mirrored onto the container's.
+
+    The point is continuity: the streamed Android is meant to feel like the
+    same device you are holding, and a remote stuck at a flat 85% breaks that
+    the moment you glance at the status bar.
+
+    `dumpsys battery set ...` is not a report, it is an *override*: the battery
+    service stops taking updates from the HAL and keeps whatever we forced,
+    for as long as the container lives — long after this daemon is gone.  So
+    every way out of here (client disconnects, mirroring switched off, daemon
+    exits) has to run `dumpsys battery reset`, and `_forced` is raised before
+    the first command rather than after the last, so a half-applied override
+    still gets cleaned up.
+
+    `set ac` alone is not enough to look unplugged: Waydroid's health HAL
+    reports AC *and* USB online by default, and a container with USB still
+    powered keeps the charging bolt in the status bar no matter what `status`
+    says.  Both rails go down together.
+    """
+
+    LEVEL_MIN, LEVEL_MAX = 0, 100
+    STATUS_CHARGING, STATUS_DISCHARGING = 2, 3   # BatteryManager.BATTERY_STATUS_*
+    ADB_TIMEOUT = 15.0
+
+    def __init__(self, adb):
+        self.adb = adb
+        self._applied = None          # last (level, charging) that fully landed
+        self._forced = False          # an override of any kind is outstanding
+        self._lock = asyncio.Lock()   # serializes the multi-command sequences
+        # Bumped by reset(). An apply() that was already in flight when the
+        # client went away carries the old epoch and is dropped rather than
+        # re-forcing a battery nobody is looking at any more.
+        self._epoch = 0
+
+    @property
+    def mirroring(self) -> bool:
+        """True while the container's battery is under our override."""
+        return self._forced
+
+    @classmethod
+    def clean_level(cls, raw):
+        """-> int in 0..100, or None for 'that was not a battery level'.
+        bool is an int in Python, and "level": true is junk, not 1."""
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            return None
+        try:
+            value = int(raw)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return max(cls.LEVEL_MIN, min(cls.LEVEL_MAX, value))
+
+    async def apply(self, level: int, charging: bool) -> None:
+        state = (int(level), bool(charging))
+        epoch = self._epoch
+        if state == self._applied:
+            return                    # no change: no adb round trip at all
+        # Outside the lock on purpose: the first resolve() can sit in an `adb
+        # connect` for seconds, and reset() must not have to queue behind it.
+        await self.adb.resolve()
+        async with self._lock:
+            if epoch != self._epoch or state == self._applied:
+                return
+            first = self._applied is None
+            self._forced = True       # before the first command, not after the last
+            await self._set("ac", "1" if state[1] else "0")
+            await self._set("usb", "1" if state[1] else "0")
+            await self._set("status", str(self.STATUS_CHARGING if state[1]
+                                          else self.STATUS_DISCHARGING))
+            await self._set("level", str(state[0]))
+            self._applied = state
+        where = "charging" if state[1] else "on battery"
+        if first:
+            log(f"battery: mirroring the client's battery — {state[0]}%, {where}")
+        else:
+            dbg(f"battery: {state[0]}%, {where}")
+
+    async def _set(self, key: str, value: str) -> None:
+        await self.adb.run("shell", "dumpsys", "battery", "set", key, value,
+                           timeout=self.ADB_TIMEOUT)
+
+    async def reset(self) -> None:
+        """Hand the battery service back to the HAL.  Idempotent, and safe to
+        call from a shutdown path where adb may already be unreachable."""
+        async with self._lock:
+            self._epoch += 1
+            if not self._forced:
+                return
+            self._forced = False
+            self._applied = None
+            try:
+                await self.adb.run("shell", "dumpsys", "battery", "reset",
+                                   timeout=self.ADB_TIMEOUT)
+            except (StreamError, OSError) as exc:
+                err(f"battery: could not release the override ({exc}) — the "
+                    "container will keep reporting the mirrored level until it "
+                    "is restarted. Run 'adb shell dumpsys battery reset'.")
+                return
+        log("battery: override released (dumpsys battery reset)")
 
 
 # ----------------------------------------------------------------- input ----
@@ -1407,15 +1923,13 @@ class ScrcpyInjector(Injector):
     PRESSURE_DOWN = 0xFFFF                          # sc_float_to_u16fp(1.0f)
     TOUCH_STRUCT = struct.Struct(">BBQiiHHHII")     # 32 bytes, big-endian
     RESTART_COOLDOWN = 60.0
-    LEASES = "/var/lib/misc/dnsmasq.waydroid0.leases"
 
-    def __init__(self, args, loop: asyncio.AbstractEventLoop):
+    def __init__(self, args, loop: asyncio.AbstractEventLoop, adb: Adb):
         self.args = args
         self.loop = loop
         self.width = args.width
         self.height = args.height
-        self.adb = args.adb or "adb"
-        self.serial = args.adb_serial          # never run adb without this
+        self.adb = adb                         # shared with the battery mirror
         self.scid = random.randrange(1, 0x7FFFFFFF)
         self.port = None
         self.proc = None                       # the `adb shell app_process` pid
@@ -1431,73 +1945,7 @@ class ScrcpyInjector(Injector):
 
     # -- adb plumbing -------------------------------------------------------
     async def _run(self, *argv, timeout=20.0, check=True):
-        """Every adb call goes through here, and every one of them carries
-        -s <serial>. A bare `adb shell` would happily target whatever phone
-        happens to be plugged into the machine — never do that."""
-        if not self.serial:
-            raise StreamError("refusing to run adb without an explicit serial")
-        cmd = [self.adb, "-s", self.serial, *argv]
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
-        try:
-            out, _ = await asyncio.wait_for(proc.communicate(), timeout)
-        except asyncio.TimeoutError:
-            proc.kill()
-            raise StreamError(f"adb {' '.join(argv[:2])} timed out after {timeout}s")
-        text = out.decode("utf-8", "replace").strip()
-        if check and proc.returncode != 0:
-            raise StreamError(f"adb {' '.join(argv[:2])} failed: {text or proc.returncode}")
-        return text
-
-    def _waydroid_ip(self):
-        """Waydroid's container IP, cheapest source first."""
-        try:
-            with open(self.LEASES, "r") as fh:
-                for line in fh:
-                    parts = line.split()
-                    if len(parts) >= 3 and parts[2].count(".") == 3:
-                        return parts[2]
-        except OSError:
-            pass
-        try:
-            out = subprocess.run(["waydroid", "status"], stdout=subprocess.PIPE,
-                                 stderr=subprocess.DEVNULL, timeout=10)
-            for line in out.stdout.decode("utf-8", "replace").splitlines():
-                if "IP address" in line:
-                    value = line.split(":", 1)[1].strip()
-                    if value and value != "UNKNOWN":
-                        return value
-        except (OSError, subprocess.SubprocessError):
-            pass
-        try:
-            out = subprocess.run(["ip", "-4", "neigh", "show", "dev", "waydroid0"],
-                                 stdout=subprocess.PIPE, timeout=5)
-            for line in out.stdout.decode().splitlines():
-                if line.split():
-                    return line.split()[0]
-        except (OSError, subprocess.SubprocessError):
-            pass
-        return None
-
-    async def _resolve_device(self) -> None:
-        if self.serial:
-            return
-        ip = self._waydroid_ip()
-        if not ip:
-            raise StreamError(
-                "cannot find the Waydroid container IP (no DHCP lease in "
-                f"{self.LEASES}, no 'IP address' from waydroid status). Android "
-                "may still be booting, or pass --adb-serial explicitly.")
-        target = f"{ip}:5555"
-        proc = await asyncio.create_subprocess_exec(
-            self.adb, "connect", target,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
-        out, _ = await asyncio.wait_for(proc.communicate(), 20.0)
-        text = out.decode("utf-8", "replace").strip()
-        if "connected to" not in text:
-            raise StreamError(f"adb connect {target}: {text}")
-        self.serial = target
-        log(f"input: adb connected to waydroid at {target} ({text})")
+        return await self.adb.run(*argv, timeout=timeout, check=check)
 
     async def _wait_boot(self) -> None:
         deadline = time.monotonic() + self.args.adb_timeout
@@ -1545,7 +1993,7 @@ class ScrcpyInjector(Injector):
         if not jar.is_file():
             raise StreamError(f"scrcpy server jar not found at {jar} "
                               "(pacman -S scrcpy, or pass --scrcpy-server)")
-        await self._resolve_device()
+        await self.adb.resolve()
         await self._wait_boot()
 
         version = self._server_version()
@@ -1567,7 +2015,7 @@ class ScrcpyInjector(Injector):
             "cleanup=true", "tunnel_forward=true",
         ]
         self.proc = await asyncio.create_subprocess_exec(
-            self.adb, "-s", self.serial, *server_cmd,
+            self.adb.binary, "-s", self.adb.serial, *server_cmd,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
         log(f"input: scrcpy server started (pid {self.proc.pid}, "
             f"scid={self.scid:08x}, control-only)")
@@ -1703,7 +2151,7 @@ class ScrcpyInjector(Injector):
             except asyncio.TimeoutError:
                 self.proc.kill()
         self.proc = None
-        if self.port is not None and self.serial:
+        if self.port is not None and self.adb.serial:
             try:
                 await self._run("forward", "--remove", f"tcp:{self.port}",
                                 timeout=10.0, check=False)
@@ -2034,11 +2482,16 @@ class Daemon:
     CONFIG_BITRATE_MIN, CONFIG_BITRATE_MAX = 500, 50000        # kbps
     CONFIG_FPS_MIN, CONFIG_FPS_MAX = 15, 120
 
-    def __init__(self, args, injector, on_fatal, hub=None):
+    def __init__(self, args, injector, on_fatal, hub=None, battery=None):
         self.args = args
         self.injector = injector
         self.on_fatal = on_fatal
         self.hub = hub
+        self.battery = battery
+        # Background work spawned off the signaling loop (battery adb calls).
+        # Held so the GC cannot collect a running task, and cancellable at
+        # shutdown so nothing re-forces state after the final reset.
+        self._side_tasks = set()
         self.loop = asyncio.get_running_loop()
         self.streamer = Streamer(args, injector, on_fatal, on_abr=self._on_abr)
         self.client = None
@@ -2127,6 +2580,10 @@ class Daemon:
             self._abr_kbps = self.args.bitrate
             self._rtt_ms = None
             self._bad_config_fields.clear()
+            # The battery override belongs to whoever is holding the phone. A
+            # no-op unless a previous session left one behind (takeover, or a
+            # detach whose reset could not reach adb).
+            await self._reset_battery()
             log(f"ws: client {peer} connected — building pipeline")
             try:
                 await self.loop.run_in_executor(
@@ -2135,6 +2592,12 @@ class Daemon:
                 await self._safe_send(ws, {"type": "error", "message": str(exc)})
                 await ws.close(code=1011, message=b"pipeline failed")
                 self.client = None
+        # nx-bridge hook: start watching the container's picker spool for this
+        # client and announce the camera bridge's state. No-op with --no-picker
+        # and when the nx-bridge companion app is not installed.
+        if self.client is ws:
+            nx_bridge.client_attached(self.args, ws,
+                                      lambda payload: self._safe_send(ws, payload))
         # Reflect the outcome to the hub: streaming on success, idle if the
         # pipeline failed above (self.client tells which).
         self._publish_hub()
@@ -2160,7 +2623,82 @@ class Daemon:
             await self.loop.run_in_executor(None, self.streamer.stop)
             if self.injector:
                 self.injector.release_all()
+            nx_bridge.client_detached(ws)  # nx-bridge hook: stop polling adb
             self._publish_hub()            # back to idle
+        # Outside the gate: an adb round trip must not hold up the next client's
+        # attach. The client is gone, so a mirrored battery is a lie now.
+        await self._reset_battery()
+
+    # -- battery mirror -----------------------------------------------------
+    async def _reset_battery(self) -> None:
+        """Hand the container's battery back to its own HAL. Never raises."""
+        if self.battery is None:
+            return
+        try:
+            await self.battery.reset()
+        except Exception as exc:            # pragma: no cover - defensive
+            warn(f"battery: reset failed ({exc!r})")
+
+    async def on_battery(self, msg) -> None:
+        """{"type":"battery","level":0..100,"charging":bool} from the phone —
+        the real device's battery, mirrored so the remote reads as the same
+        one.  {"type":"battery","enabled":false} is how the client says the
+        user switched mirroring off, and releases the override.
+
+        Everything is validated here rather than trusted: the client is a phone
+        on the other side of a VPN, and `dumpsys battery set level` will happily
+        accept a number that leaves the container looking broken.
+        """
+        if self.battery is None:
+            if "battery" not in self._bad_config_fields:
+                self._bad_config_fields.add("battery")
+                warn("battery: no adb device configured — cannot mirror the "
+                     "client's battery (video and touch are unaffected)")
+            return
+        if msg.get("enabled") is False:
+            await self._reset_battery()
+            return
+        if self.client is None:
+            # This runs off the signaling loop, so a message can be spawned and
+            # the client can vanish before the task ever starts — and detach's
+            # reset would then be undone by an apply for a phone that is no
+            # longer there. BatteryMirror's epoch guard catches the mirror image
+            # of this (a task already in flight); between them nothing outlives
+            # its session.
+            return
+        level = BatteryMirror.clean_level(msg.get("level"))
+        if level is None:
+            self._config_junk("battery level", msg.get("level"))
+            return
+        charging = msg.get("charging")
+        if not isinstance(charging, bool):
+            if charging is not None:
+                self._config_junk("battery charging", charging)
+            charging = False
+        try:
+            await self.battery.apply(level, charging)
+        except (StreamError, OSError) as exc:
+            warn(f"battery: could not mirror {level}% ({exc})")
+
+    def _spawn(self, coro) -> None:
+        """Run something off the signaling loop, held so the GC cannot collect
+        a task that is still running."""
+        task = asyncio.ensure_future(coro)
+        self._side_tasks.add(task)
+        task.add_done_callback(self._side_tasks.discard)
+
+    async def aclose(self) -> None:
+        """Shutdown: stop anything that could still be changing the container,
+        then release the battery override."""
+        for task in list(self._side_tasks):
+            task.cancel()
+        for task in list(self._side_tasks):
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._side_tasks.clear()
+        await self._reset_battery()
 
     # -- config channel -----------------------------------------------------
     def config_state(self, note=None) -> dict:
@@ -2357,7 +2895,15 @@ class Daemon:
             # to set bitrate/fps before (or without) the datachannel ever
             # opening, and the datachannel stays input-only.
             await self.on_config(ws, msg)
-        else:
+        elif kind == "battery":
+            # Fire-and-forget on purpose. Mirroring costs three adb round trips
+            # and the first one can sit in an `adb connect` for seconds; an
+            # answer or an ICE candidate queued behind a slow `dumpsys` is a
+            # session that never connects. BatteryMirror serializes internally.
+            self._spawn(self.on_battery(msg))
+        # nx-bridge hook: pick-data / pick-cancel / camera. Returns False for
+        # anything it does not own, so the unknown-type warning stays honest.
+        elif not await nx_bridge.on_message(ws, msg):
             warn(f"ws: unknown message type {kind!r}")
 
     # -- http ---------------------------------------------------------------
@@ -2399,6 +2945,11 @@ class Daemon:
             "input": self.injector.label if self.injector else "none",
             "input_ready": bool(getattr(self.injector, "connected",
                                         self.injector is not None)),
+            # What is actually being captured, not what was asked for: --audio
+            # degrades to video-only rather than failing, and this is where you
+            # see which of the two happened.
+            "audio": self.args.audio_source,
+            "battery_mirrored": bool(self.battery and self.battery.mirroring),
         })
 
     def build_app(self) -> web.Application:
@@ -2462,6 +3013,15 @@ def parse_args(argv=None):
     p.add_argument("--no-abr", action="store_true",
                    help="disable adaptive bitrate and pin the encoder to "
                         "--bitrate (the pre-0.2 behaviour)")
+    p.add_argument("--audio", default="none", metavar="auto|none|SOURCE",
+                   help="stream the container's audio as a second WebRTC track: "
+                        "'none' (default, video only); 'auto' to route Waydroid "
+                        "into a private null sink and capture its monitor — "
+                        "Waydroid has no monitor source of its own, see "
+                        "AudioRoute; or the name of a PulseAudio source to "
+                        "capture verbatim (pactl list short sources)")
+    p.add_argument("--audio-bitrate", type=int, default=96000,
+                   help="opus bitrate in bits/s (default 96000)")
     p.add_argument("--wayland-display", required=True,
                    help="wayland socket of the headless session, e.g. wayland-1")
     p.add_argument("--output", default="HEADLESS-1", help="wlr output to capture")
@@ -2494,6 +3054,7 @@ def parse_args(argv=None):
                    help="disable the NX Hub connector (status bus). It is "
                         "enabled by default and stays silent when no hub is "
                         "running; honours $NX_HUB_DATA_DIR for the token path.")
+    nx_bridge.add_arguments(p)     # nx-bridge hook: --camera, --no-picker
     args = p.parse_args(argv)
     if args.no_input:
         args.input = "none"
@@ -2505,6 +3066,12 @@ def parse_args(argv=None):
         args.min_bitrate = args.bitrate
     if args.adb is None:
         args.adb = shutil.which("adb")
+    if args.audio_bitrate < 6000:
+        args.audio_bitrate = 6000          # opusenc's own floor
+    # Filled in by serve() once AudioRoute has resolved (or refused to): the
+    # pipeline reads this, never --audio itself, so "asked for audio" and "has
+    # a source to capture" can never be confused.
+    args.audio_source = None
 
     here = Path(__file__).resolve().parent
     args.web_root = str(Path(args.web_root).resolve()) if args.web_root \
@@ -2513,7 +3080,7 @@ def parse_args(argv=None):
     return args
 
 
-def build_injector(args, loop):
+def build_injector(args, loop, adb):
     """The touch path. Failing to build one is never fatal to the video."""
     if args.input == "none":
         warn("input: --input none — no touch injection at all "
@@ -2524,13 +3091,30 @@ def build_injector(args, loop):
              "seat/libinput backend; our headless sway does not (see "
              "ARCHITECTURE.md)")
         return TouchInjector(args.width, args.height)
-    if not args.adb:
+    if adb is None:
         err("input: no adb binary found (pass --adb) — touch disabled, "
             "video unaffected")
         return None
-    injector = ScrcpyInjector(args, loop)
+    injector = ScrcpyInjector(args, loop, adb)
     injector.start_background()
     return injector
+
+
+async def audio_watch(route: AudioRoute, stop: asyncio.Event) -> None:
+    """Keep re-homing Waydroid's playback streams while we are up.
+
+    Android opens the PCM when an app plays and closes it when it stops, so the
+    stream we routed at startup is not the stream that exists ten minutes later.
+    Never allowed to raise: audio housekeeping cannot be a reason to lose video.
+    """
+    while not stop.is_set():
+        try:
+            await asyncio.sleep(route.POLL_INTERVAL)
+            route.poll()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:              # pragma: no cover - defensive
+            dbg(f"audio: poll failed ({exc!r})")
 
 
 async def serve(args, glib_loop) -> int:
@@ -2544,7 +3128,17 @@ async def serve(args, glib_loop) -> int:
         # THREAD BOUNDARY 3: any thread -> asyncio, shutdown only.
         loop.call_soon_threadsafe(stop.set)
 
-    injector = build_injector(args, loop)
+    # One adb target for everything that talks into the container: the touch
+    # path and the battery mirror share it, so the device is discovered once.
+    adb = Adb(args.adb, args.adb_serial) if args.adb else None
+    injector = build_injector(args, loop, adb)
+    battery = BatteryMirror(adb) if adb is not None else None
+
+    # Audio is resolved before anything can connect, so the source exists for
+    # the very first offer. Defaults to none and degrades to none: this must
+    # not be able to cost the working video path a negotiation.
+    audio = AudioRoute(args.audio)
+    args.audio_source = audio.resolve()
 
     # NX Hub connector: optional, silent, and isolated. A shutdown-request on
     # the bus must trigger exactly the same clean exit as SIGTERM — set `stop`.
@@ -2555,7 +3149,7 @@ async def serve(args, glib_loop) -> int:
             stop.set()
         hub = HubConnector(version=VERSION, on_shutdown_request=_hub_shutdown)
 
-    daemon = Daemon(args, injector, fatal, hub=hub)
+    daemon = Daemon(args, injector, fatal, hub=hub, battery=battery)
     try:
         runner = web.AppRunner(daemon.build_app(), access_log=None,
                                shutdown_timeout=5.0)
@@ -2577,6 +3171,12 @@ async def serve(args, glib_loop) -> int:
             f"adaptive {args.min_bitrate}-{args.bitrate} kbps")
     log(f"capturing {args.output} on WAYLAND_DISPLAY={args.wayland_display} "
         f"at {args.width}x{args.height}@{args.fps}, {mode}")
+    log("audio: " + (f"opus from {args.audio_source} @ {args.audio_bitrate} bps"
+                     if args.audio_source else "off (--audio none)"))
+
+    audio_task = None
+    if args.audio_source and args.audio == "auto":
+        audio_task = asyncio.ensure_future(audio_watch(audio, stop))
 
     # Seed the hub with our initial state (idle), then let it reconnect forever
     # in the background. It never blocks or crashes the streamer if absent.
@@ -2600,6 +3200,13 @@ async def serve(args, glib_loop) -> int:
             except (asyncio.CancelledError, Exception):
                 pass
 
+    if audio_task is not None:
+        audio_task.cancel()
+        try:
+            await audio_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
     # Order matters: stop the injector retrying and hang up on the client
     # first, so neither can stretch the shutdown out.
     if injector is not None:
@@ -2607,11 +3214,18 @@ async def serve(args, glib_loop) -> int:
     await daemon.close_client()
     await runner.cleanup()
     await loop.run_in_executor(None, daemon.streamer.stop)
+    # Before adb goes away: cancel anything still in flight and release the
+    # battery override. A container left pinned at the last mirrored level
+    # would stay that way until it is restarted.
+    await daemon.aclose()
     if injector is not None:
         try:
             await injector.aclose()
         except Exception as exc:
             warn(f"input: shutdown: {exc}")
+    # Last, once nothing is capturing the monitor any more: put the audio graph
+    # back exactly as we found it.
+    audio.release()
     glib_loop.quit()
     return exit_code["code"]
 

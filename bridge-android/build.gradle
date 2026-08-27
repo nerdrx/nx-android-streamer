@@ -1,0 +1,18 @@
+// Same toolchain as client-android, deliberately: AGP 8.9.1, Kotlin 2.0.21,
+// Gradle 8.13 (see gradle/wrapper). Two Gradle projects rather than one with two
+// modules because this APK ships *into the container* and the client ships onto
+// the phone — different lifecycles, different release cadence, no shared code.
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.android.tools.build:gradle:8.9.1'
+        classpath 'org.jetbrains.kotlin:kotlin-gradle-plugin:2.0.21'
+    }
+}
+
+tasks.register('clean', Delete) {
+    delete rootProject.layout.buildDirectory
+}

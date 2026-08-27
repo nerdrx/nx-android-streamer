@@ -60,6 +60,14 @@ class StreamClient(
     interface Listener {
         fun onPhase(phase: Phase)
         fun onRtt(rttMs: Int?)
+
+        // nx-bridge: two seams for the picker/camera bridges, so neither has to
+        // live inside this class.
+        /** A signaling frame this class does not own (pick, camera, …). */
+        fun onServerMessage(msg: JSONObject) {}
+        /** The offer is applied and the answer has NOT been created yet — the
+         *  only window in which a transceiver's direction can still be chosen. */
+        fun onRemoteOfferApplied(pc: PeerConnection, sdp: String) {}
     }
 
     private val main = Handler(Looper.getMainLooper())
@@ -94,6 +102,10 @@ class StreamClient(
     // Last quality settings the user chose; re-sent on every (re)connect so the
     // server always matches the phone's UI, including after a drop.
     private var pendingConfig: Triple<Int, Int, Boolean>? = null
+    // Last battery reading we mirrored, re-sent on every (re)connect so a fresh
+    // session starts matched instead of waiting for the next percent to tick.
+    // Null while mirroring is off.
+    private var pendingBattery: Pair<Int, Boolean>? = null
     private var connectStartedAt = 0L
 
     private val pingRunnable = object : Runnable {
@@ -154,16 +166,50 @@ class StreamClient(
      */
     fun sendConfig(bitrateKbps: Int, fps: Int, abr: Boolean) {
         pendingConfig = Triple(bitrateKbps, fps, abr)
+        sendSignal(
+            JSONObject()
+                .put("type", "config")
+                .put("bitrate", bitrateKbps)
+                .put("fps", fps)
+                .put("abr", abr),
+            "config"
+        )
+    }
+
+    /**
+     * Mirror this phone's battery onto the remote Android, so the streamed
+     * device reads as the one in your hand. Same rules as [sendConfig]: safe
+     * before the socket exists, and re-sent on every reconnect.
+     */
+    fun sendBattery(level: Int, charging: Boolean) {
+        val state = Pair(level.coerceIn(0, 100), charging)
+        pendingBattery = state
+        sendSignal(
+            JSONObject()
+                .put("type", "battery")
+                .put("level", state.first)
+                .put("charging", state.second),
+            "battery"
+        )
+    }
+
+    /**
+     * Mirroring was switched off: tell the server to hand the container's
+     * battery back to its own driver. The server's override outlives our
+     * process, so this has to be said out loud rather than just stopping.
+     */
+    fun sendBatteryOff() {
+        pendingBattery = null
+        sendSignal(JSONObject().put("type", "battery").put("enabled", false), "battery")
+    }
+
+    /** Best-effort signaling send: no socket yet is normal, not an error. */
+    private fun sendSignal(msg: JSONObject, what: String) {
         val sock = ws ?: return
-        val msg = JSONObject()
-            .put("type", "config")
-            .put("bitrate", bitrateKbps)
-            .put("fps", fps)
-            .put("abr", abr)
         try {
             sock.send(msg.toString())
         } catch (e: Exception) {
-            Log.w(TAG, "config send failed: ${e.message}")
+            Log.w(TAG, "$what send failed: ${e.message}")
         }
     }
 
@@ -224,6 +270,7 @@ class StreamClient(
                     if (myGen != gen) return@post
                     Log.d(TAG, "ws open, waiting for offer")
                     pendingConfig?.let { (b, f, a) -> sendConfig(b, f, a) }
+                    pendingBattery?.let { (l, c) -> sendBattery(l, c) }
                 }
             }
 
@@ -253,7 +300,8 @@ class StreamClient(
                 Log.d(TAG, "server config: ${msg.optInt("bitrate")}kbps " +
                     "${msg.optInt("fps")}fps abr=${msg.optBoolean("abr")}")
             }
-            else -> {}
+            // nx-bridge: pick / camera and anything else the daemon adds later.
+            else -> listener.onServerMessage(msg)
         }
     }
 
@@ -264,6 +312,9 @@ class StreamClient(
             override fun onSetSuccess() {
                 main.post {
                     if (myGen != gen) return@post
+                    // nx-bridge: last chance to set a transceiver's direction —
+                    // createAnswer() below freezes it.
+                    listener.onRemoteOfferApplied(peer, sdp)
                     peer.createAnswer(object : SdpObserver {
                         override fun onCreateSuccess(answer: SessionDescription) {
                             main.post {
@@ -322,6 +373,21 @@ class StreamClient(
 
     private fun send(obj: JSONObject) {
         ws?.send(obj.toString())
+    }
+
+    // nx-bridge: the picker and camera bridges own their own message types but
+    // share this socket. Both call these from the main looper, like everything
+    // else in this class.
+    /** Put one bridge frame on the signaling socket. No-op while it is down. */
+    fun sendBridgeFrame(obj: JSONObject) = sendSignal(obj, obj.optString("type"))
+
+    /** Bytes OkHttp still has queued for this socket. The picker paces a
+     *  multi-megabyte upload on it so the transfer cannot bury SDP/ICE frames
+     *  (or the phone's heap) while a reconnect is trying to happen. */
+    fun signalBacklogBytes(): Long = try {
+        ws?.queueSize() ?: 0L
+    } catch (e: Exception) {
+        0L
     }
 
     // ---------------------------------------------------------------------
