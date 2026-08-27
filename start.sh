@@ -29,9 +29,15 @@ cmd_setup() {
     fi
 
     local pkgs=()
-    need waydroid || pkgs+=(waydroid)
-    need sway     || pkgs+=(sway)
+    need waydroid    || pkgs+=(waydroid)
+    need sway        || pkgs+=(sway)
+    need wf-recorder || pkgs+=(wf-recorder)
+    need grim        || pkgs+=(grim)
+    need vainfo      || pkgs+=(libva-utils)
     need gst-launch-1.0 || pkgs+=(gstreamer gst-plugins-good gst-plugins-bad gst-plugin-va gst-plugin-pipewire)
+    pacman -Q gst-plugins-ugly &>/dev/null || pkgs+=(gst-plugins-ugly)   # x264enc software fallback
+    python -c 'import aiohttp' 2>/dev/null || pkgs+=(python-aiohttp)
+    python -c 'import evdev'   2>/dev/null || pkgs+=(python-evdev)
     if ((${#pkgs[@]})); then
         log "installing: ${pkgs[*]}"
         sudo pacman -S --needed "${pkgs[@]}" || die "pacman failed — AUR-only package? try paru -S ${pkgs[*]}"
