@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # nx-android-streamer — starter script
 # Brings up a headless Waydroid session at phone geometry, ready for a streamer.
-# Subcommands: setup | arm | up | serve | gui | stream | doctor | down | status | ref
+# Subcommands: setup | arm | up | serve | gui | stream | doctor | unfreeze | down | status | ref
 set -euo pipefail
 
 W=${NXAS_WIDTH:-1080}
@@ -246,6 +246,58 @@ cmd_stream() {
     [[ -n "$avahi_pid" ]] && kill "$avahi_pid" 2>/dev/null || true
 }
 
+# -------------------------------------------------------------- unfreeze ----
+# Waydroid's SurfaceFlinger can wedge: android keeps running and processing
+# input (the resumed activity changes, dumpsys reacts) but stops producing new
+# frames, so the compositor — and therefore the stream — shows one stale image
+# forever. It reads to a user as "the stream froze and my taps do nothing",
+# which is the single most confusing failure this project has. Detect it by
+# comparing two captures a moment apart while forcing a redraw in between.
+nxas_screen_is_frozen() {
+    local disp=$1 dev=$2
+    need grim || return 1
+    local a=$STATE/frz-a.png b=$STATE/frz-b.png
+    WAYLAND_DISPLAY=$disp grim -o HEADLESS-1 "$a" 2>/dev/null || return 1
+    # Poke something guaranteed to repaint: toggle the notification shade.
+    adb -s "$dev" shell cmd statusbar expand-notifications >/dev/null 2>&1
+    sleep 1
+    adb -s "$dev" shell cmd statusbar collapse >/dev/null 2>&1
+    sleep 1
+    WAYLAND_DISPLAY=$disp grim -o HEADLESS-1 "$b" 2>/dev/null || return 1
+    cmp -s "$a" "$b"        # identical after a forced repaint => frozen
+}
+
+cmd_unfreeze() {
+    [[ -f $STATE/wayland-display ]] || die "no session — ./start.sh up first"
+    local disp dev
+    disp=$(cat "$STATE/wayland-display")
+    dev=$(adb devices 2>/dev/null | awk '/5555[[:space:]]*device/{print $1; exit}')
+    [[ -n $dev ]] || die "adb can't reach android — ./start.sh doctor first"
+
+    if nxas_screen_is_frozen "$disp" "$dev"; then
+        log "surfaceflinger is wedged (no repaint) — restarting the session"
+        waydroid session stop 2>/dev/null || true
+        sleep 4
+        (WAYLAND_DISPLAY=$disp setsid waydroid show-full-ui >"$STATE/waydroid.log" 2>&1 &)
+        sleep 20
+        adb connect "$dev" >/dev/null 2>&1 || true
+        nxas_keep_awake "$dev"
+        log "session restarted — reconnect the phone"
+    else
+        log "screen is repainting normally, nothing to unfreeze ✓"
+    fi
+}
+
+# Android must never sleep or lock: the only display is the stream, and a
+# sleeping android ignores injected touch AND stops repainting.
+nxas_keep_awake() {
+    local dev=$1
+    adb -s "$dev" shell "settings put system screen_off_timeout 2147483647; \
+                         settings put secure sleep_timeout -1; \
+                         svc power stayon true; \
+                         locksettings set-disabled true" >/dev/null 2>&1 || true
+}
+
 # --------------------------------------------------------------- doctor ----
 cmd_doctor() {
     # Waydroid network + adb repair. The classic failure: Android never sends a
@@ -329,6 +381,12 @@ cmd_doctor() {
                 sudo ufw allow from "$subnet" to any
             fi
         fi
+    fi
+
+    # Never let android sleep or lock — the stream is its only display.
+    if adb devices 2>/dev/null | grep -q "5555[[:space:]]*device"; then
+        nxas_keep_awake "$(adb devices | awk '/5555[[:space:]]*device/{print $1; exit}')"
+        log "screen timeout + lockscreen disabled ✓"
     fi
 
     log "authorizing host adb key + enabling adbd on tcp/5555..."
@@ -427,6 +485,7 @@ case "${1:-default}" in
     down)   cmd_down ;;
     status) cmd_status ;;
     doctor) cmd_doctor ;;
+    unfreeze) cmd_unfreeze ;;
     ref)    cmd_ref ;;
     *)      sed -n '2,4p' "$0" | sed 's/^# //'; exit 1 ;;
 esac

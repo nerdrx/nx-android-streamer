@@ -1161,13 +1161,35 @@ class Streamer:
                 self.abr = None
             if self.pipeline is not None:
                 log("pipeline: -> NULL")
-                bus = self.pipeline.get_bus()
-                try:
-                    bus.remove_signal_watch()
-                except Exception:
-                    pass
-                self.pipeline.set_state(Gst.State.NULL)
-                self.pipeline = None
+                pipeline = self.pipeline
+                self.pipeline = None          # nobody else may touch it now
+                # THREAD BOUNDARY 5: the state change MUST run on the GLib
+                # thread. Tearing the pipeline down from asyncio while webrtcbin
+                # was mid-negotiation on the GLib thread (create-offer promise
+                # still in flight) freed objects out from under it — glibc
+                # aborted the process with "double free or corruption". A client
+                # that vanishes during negotiation is completely routine, so
+                # this crashed the daemon on ordinary disconnects.
+                def _to_null() -> bool:
+                    # Drop the bus watch here, not before: removing it while the
+                    # GLib thread is dispatching a message on it is itself a
+                    # use-after-free.
+                    try:
+                        pipeline.get_bus().remove_signal_watch()
+                    except Exception:
+                        pass
+                    try:
+                        pipeline.set_state(Gst.State.NULL)
+                    except Exception as exc:
+                        warn(f"pipeline: teardown failed ({exc})")
+                    return False               # one-shot
+
+                # A short delay, not idle_add: a client that vanishes mid-offer
+                # leaves a create-offer promise still running on the GLib thread,
+                # and freeing the pipeline under it aborts the process. Let the
+                # in-flight callbacks finish first. We do NOT block asyncio
+                # waiting for this — the session is already logically gone.
+                GLib.timeout_add(400, _to_null)
             self.webrtc = None
             self.venc = None
             if self.capture is not None:

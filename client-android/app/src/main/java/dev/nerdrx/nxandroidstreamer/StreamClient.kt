@@ -349,6 +349,18 @@ class StreamClient(
                 if (channel.label() != "input") return@post
                 dc = channel
                 channel.registerObserver(InputChannelObserver(myGen, channel))
+                // The server creates this channel BEFORE negotiation, so it is
+                // frequently already OPEN by the time we get here — and an
+                // observer registered on an already-open channel never receives
+                // onStateChange. Missing that edge meant ping/pong never started
+                // (no RTT, no health signal) and the session never flipped to
+                // LIVE, so the pill sat on "connecting…" over working video.
+                if (channel.state() == DataChannel.State.OPEN) {
+                    Log.d(TAG, "input channel already open")
+                    lastPongAt = System.currentTimeMillis()
+                    startPing(myGen)
+                    markLiveIfReady()
+                }
             }
         }
 
