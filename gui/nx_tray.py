@@ -128,7 +128,10 @@ def orb_icon(state):
 
 class Panel(QWidget):
     def __init__(self, app):
-        super().__init__(None, Qt.Window | Qt.FramelessWindowHint)
+        # A normal decorated window: on Wayland a frameless tool window can end
+        # up unmovable or simply never mapped, and this is the panel the user
+        # actually looks at.
+        super().__init__(None, Qt.Window)
         self.app = app
         self.setWindowTitle("NX Android Streamer")
         self.setAttribute(Qt.WA_TranslucentBackground, False)
@@ -377,6 +380,12 @@ class TrayApp:
 
     def run(self):
         self.set_state("idle")
+        # Show the panel on launch. Tray-only start hides the app behind
+        # Plasma's "expand" arrow and reads as "nothing happened".
+        if not os.environ.get("NXAS_TRAY_ONLY"):
+            self.show_panel()
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            print("note: no system tray host — running as a plain window", file=sys.stderr)
         return self.qt.exec()
 
 
