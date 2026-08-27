@@ -159,14 +159,40 @@ cmd_stream() {
     need adb || log "note: adb not found — touch injection is disabled (pacman -S"
     need adb || log "      android-tools). Video still streams; --input none silences it."
 
-    # The session runs at ${HZ}Hz; v0.1 streams $fps and lets the client pace.
+    # Best reachable address, in preference order: explicit override, tailscale,
+    # first non-loopback LAN IP. This is what the phone connects to — so it is
+    # what we put in the QR code and advertise over mDNS.
+    local addr
+    addr=${NXAS_ADDR:-}
+    [[ -z $addr ]] && addr=$(tailscale ip -4 2>/dev/null | head -1)
+    [[ -z $addr ]] && addr=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+    [[ -z $addr ]] && addr="<pc-address>"
+
+    # Zero-typing pairing. mDNS lets a same-network phone discover this server
+    # with no address at all; the QR carries the address for across-Tailscale,
+    # where mDNS may not cross the tailnet. Both encode the same nxas:// URI.
+    local avahi_pid=""
+    if need avahi-publish-service && systemctl is-active -q avahi-daemon 2>/dev/null; then
+        avahi-publish-service "NX Android Streamer @ $(hostname)" _nxstream._tcp "$port" \
+            "addr=$addr" "w=$W" "h=$H" >/dev/null 2>&1 &
+        avahi_pid=$!
+    fi
+    trap '[[ -n "$avahi_pid" ]] && kill "$avahi_pid" 2>/dev/null; exit 0' INT TERM
+
     log "streaming ${W}x${H}@${fps} from $disp on port $port — Ctrl-C to stop"
-    log "phone client: http://<pc-address>:$port  (over tailscale/wireguard)"
-    exec python "$ROOT/server/nx-streamerd.py" \
+    if need qrencode && [[ $addr != "<pc-address>" ]]; then
+        log "scan to pair the app (or let it find this server over mDNS):"
+        qrencode -t ANSIUTF8 "nxas://$addr:$port"
+    fi
+    log "phone client (browser): http://$addr:$port"
+    [[ -n $avahi_pid ]] && log "mDNS: advertising _nxstream._tcp on $port ✓"
+
+    python "$ROOT/server/nx-streamerd.py" \
         --wayland-display "$disp" \
         --width "$W" --height "$H" --fps "$fps" \
         --bitrate "${NXAS_BITRATE:-12000}" \
         --port "$port" "$@"
+    [[ -n "$avahi_pid" ]] && kill "$avahi_pid" 2>/dev/null || true
 }
 
 # --------------------------------------------------------------- doctor ----
