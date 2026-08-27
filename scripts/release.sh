@@ -18,9 +18,16 @@ find "$DIST/$NAME" -name '__pycache__' -type d -prune -exec rm -rf {} +
 tar -C "$DIST" -czf "$DIST/$NAME.tar.gz" "$NAME"
 rm -rf "${DIST:?}/$NAME"
 
-# APK joins the release once the Kotlin client exists
-[[ -f "$ROOT/client-android/app/build/outputs/apk/release/nx-android-streamer-${V}.apk" ]] \
-    && cp "$ROOT/client-android/app/build/outputs/apk/release/nx-android-streamer-${V}.apk" "$DIST/"
+# The phone client. Gradle always writes app-release.apk, so take THAT and name
+# it for this release — matching on a version-stamped filename meant every
+# release silently shipped with no app when the local build had another name.
+APK="$ROOT/client-android/app/build/outputs/apk/release/app-release.apk"
+if [[ -f $APK ]]; then
+    cp "$APK" "$DIST/nx-android-streamer-${V}.apk"
+else
+    echo "WARNING: no APK at $APK — releasing WITHOUT the phone client." >&2
+    echo "  build it first: cd client-android && ./gradlew assembleRelease" >&2
+fi
 
 cd "$DIST"
 for f in *.tar.gz *.apk; do [[ -f $f ]] && sha256sum "$f" > "$f.sha256"; done
