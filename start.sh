@@ -374,9 +374,19 @@ cmd_ref() {
 }
 
 # ----------------------------------------------------------------- main ----
-# Bare invocation means "serve". NX Hub launches the binHint with no arguments,
-# and a usage-and-exit-1 there reads to the user as "Launch does nothing".
-case "${1:-serve}" in
+# Bare invocation is what NX Hub's Launch (and the .desktop entry) runs, with no
+# arguments. On a desktop that means the tray control panel — a person pressing
+# Launch expects a window. Headless (ssh, service), fall back to serving.
+cmd_default() {
+    if [[ -n ${WAYLAND_DISPLAY:-}${DISPLAY:-} ]] && python -c 'import PySide6' 2>/dev/null; then
+        cmd_gui
+    else
+        cmd_serve
+    fi
+}
+
+case "${1:-default}" in
+    default) cmd_default ;;
     setup)  cmd_setup ;;
     arm)    cmd_arm ;;
     up)     cmd_up ;;
