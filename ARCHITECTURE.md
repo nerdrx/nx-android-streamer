@@ -108,6 +108,17 @@ complete means the phone's *hardware* is visible to the PC's Android too.
   for both. Idle cost is zero: reverse tracks are negotiated only while an
   Android app actually holds the camera/mic open.
 
+## Shared storage — one gallery (planned, v0.3)
+
+The container's `/sdcard` is a plain host directory, which turns "shared
+gallery" into a file-sync problem with an existing best-in-class answer:
+**Syncthing** (phone `DCIM`/`Pictures` ↔ a host folder inside Waydroid's
+storage), plus an adb `media scan` poke so MediaStore indexes arrivals
+immediately. Photos taken on the real phone appear in the remote gallery;
+remote screenshots and downloads flow back. A network drive/SMB share can't do
+this — Android galleries only index local MediaStore storage, which is exactly
+what the sync target is.
+
 ## Native-feel checklist
 
 The bar: someone picks up the Pixel and doesn't notice it's remote.
@@ -123,6 +134,7 @@ The bar: someone picks up the Pixel and doesn't notice it's remote.
 - [ ] Waydroid notifications bridged to real phone notifications
 - [ ] phone camera available to remote Android apps (v4l2loopback bridge)
 - [ ] phone mic available to remote Android apps (virtual PipeWire source)
+- [ ] one gallery: photos sync both ways (Syncthing into /sdcard + media scan)
 - [ ] battery drain comparable to video playback
 
 ## Latency budget (target, 5G)
