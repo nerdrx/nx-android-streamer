@@ -2483,6 +2483,11 @@ class HubConnector:
 
 # ------------------------------------------------------------- signaling ----
 
+# The client is served straight off disk and updated often; a stale cached
+# app.js means a fixed bug that keeps happening on the phone.
+NO_STORE = {"Cache-Control": "no-store, must-revalidate"}
+
+
 class Daemon:
     """Owns the single-client policy and both event loops' handoffs."""
 
@@ -2974,14 +2979,14 @@ class Daemon:
         index = root / "index.html"
         if index.is_file():
             async def serve_index(_request):
-                return web.FileResponse(index)
+                return web.FileResponse(index, headers=NO_STORE)
 
             async def serve_file(request):
                 # Manual resolve so a crafted path can't escape the web root.
                 target = (root / request.match_info["path"]).resolve()
                 if root not in target.parents or not target.is_file():
                     raise web.HTTPNotFound()
-                return web.FileResponse(target)
+                return web.FileResponse(target, headers=NO_STORE)
 
             app.router.add_get("/", serve_index)
             # Registered last: both of these are catch-alls.

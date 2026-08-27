@@ -145,7 +145,7 @@ class StreamActivity : AppCompatActivity(), StreamClient.Listener, StreamView.Ca
             .createAudioDeviceModule()
         factory = PeerConnectionFactory.builder()
             .setAudioDeviceModule(audioModule)
-            .setVideoDecoderFactory(DefaultVideoDecoderFactory(eglBase.eglBaseContext))
+            .setVideoDecoderFactory(org.webrtc.NxLowLatencyDecoderFactory(eglBase.eglBaseContext))
             .setVideoEncoderFactory(DefaultVideoEncoderFactory(eglBase.eglBaseContext, true, true))
             .setOptions(PeerConnectionFactory.Options())
             .createPeerConnectionFactory()

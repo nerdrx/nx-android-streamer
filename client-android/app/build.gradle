@@ -13,8 +13,8 @@ android {
         // on anything the private VPN might reach without giving up anything we need.
         minSdk 29
         targetSdk 35
-        versionCode 70
-        versionName "0.7.0"
+        versionCode 71
+        versionName "0.7.1"
     }
 
     // No real upload key yet. The release build is signed with the debug key so
