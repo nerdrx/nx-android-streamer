@@ -165,8 +165,22 @@
       return;
     }
 
+    window.nxPc = pc;             // debug handle: getStats() from the console
+
     pc.ontrack = function (ev) {
       if (myGen !== gen) return;
+      // WebRTC's receiver buffers for SMOOTHNESS by default — typically 100ms+
+      // of jitter buffer, and it grows whenever the link wobbles. For a remote
+      // desktop that delay IS the lag you feel when you tap. Ask for none: we
+      // would rather show a late frame immediately than hold every frame back.
+      try {
+        if (ev.receiver && 'playoutDelayHint' in ev.receiver) {
+          ev.receiver.playoutDelayHint = 0;
+        }
+        if (ev.receiver && ev.receiver.jitterBufferTarget !== undefined) {
+          ev.receiver.jitterBufferTarget = 0;
+        }
+      } catch (e) { /* not fatal, just slower */ }
       var stream = (ev.streams && ev.streams[0]) || new MediaStream([ev.track]);
       if (video.srcObject !== stream) {
         video.srcObject = stream;
