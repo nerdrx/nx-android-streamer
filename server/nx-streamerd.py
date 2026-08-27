@@ -44,6 +44,7 @@ gi.require_version("GstWebRTC", "1.0")
 gi.require_version("GstSdp", "1.0")
 from gi.repository import GLib, Gst, GstSdp, GstWebRTC  # noqa: E402
 
+import aiohttp  # noqa: E402
 from aiohttp import WSMsgType, web  # noqa: E402
 
 # ------------------------------------------------------------------- log ----
@@ -84,6 +85,20 @@ def die(msg: str) -> None:
     """Startup-only: SystemExit is safe on the main thread."""
     err(msg)
     raise SystemExit(1)
+
+
+# Daemon version, reported to NX Hub in the connector `hello`.
+VERSION = "0.1"
+
+# The hub connector is meant to be *silent* — a machine without NX Hub is the
+# common case and must produce no warnings.  Anything the connector wants to say
+# goes through dbg(), which is off unless NXAS_DEBUG / NX_DEBUG is set.
+_DEBUG = bool(os.environ.get("NXAS_DEBUG") or os.environ.get("NX_DEBUG"))
+
+
+def dbg(msg: str) -> None:
+    if _DEBUG:
+        _emit(_YELLOW, "dbg ", msg)
 
 
 class StreamError(RuntimeError):
@@ -1209,19 +1224,265 @@ class ScrcpyInjector(Injector):
         self._closing = True
 
 
+# ------------------------------------------------------------ hub bus ----
+
+_MISSING = object()
+
+
+class HubConnector:
+    """Streams live daemon status onto NX Hub's local connector bus.
+
+    Wholly optional and wholly silent.  On a machine where NX Hub is not
+    installed the token file never appears and nothing answers on port 9021 —
+    that is the common case, so we never log, warn, or fail our own startup over
+    it (§8 of PROTOCOL.md).  The whole lifecycle is wrapped so an exception just
+    retries; it must never block or crash the streamer.
+
+    We lean on aiohttp's WebSocket *client*, which is already a dependency: it
+    masks every client->hub frame (§1) and verifies the server's
+    Sec-WebSocket-Accept during the handshake (§1) for us, so there is no
+    hand-rolled RFC 6455 to get wrong here.
+    """
+
+    URL = "ws://127.0.0.1:9021"          # loopback only, per §1
+    APP_ID = "nx-android-streamer"        # repo name, lowercased — attaches the
+                                          # status strip to the right hub card
+    MAX_FRAME = 16384                     # §1: 16 KB reassembled cap
+    BACKOFF_START = 1.0
+    BACKOFF_MAX = 30.0
+    MIN_SEND_INTERVAL = 0.25              # §4: pre-throttle to <= 4 status/s
+
+    def __init__(self, *, version, on_shutdown_request, data_dir=None):
+        self.version = str(version)
+        self._on_shutdown_request = on_shutdown_request
+        self._data_dir = data_dir         # explicit override (tests); otherwise
+                                          # $NX_HUB_DATA_DIR / the default path
+        self._fields = {}                 # last-known full merged status
+        self._dirty = asyncio.Event()     # created on the loop thread
+        self._ws = None                   # live client ws, for a best-effort bye
+        self._closing = False
+        self._last_send = 0.0
+
+    # -- token --------------------------------------------------------------
+    def _token_path(self) -> Path:
+        base = self._data_dir or os.environ.get("NX_HUB_DATA_DIR")
+        if base:
+            return Path(base) / "connector.token"
+        return Path.home() / ".local" / "share" / "nx-hub" / "connector.token"
+
+    def _read_token(self):
+        """Re-read on every attempt (§2): the file may not exist yet if we
+        started before NX Hub ever ran.  Missing == 'no hub', stay silent."""
+        try:
+            raw = self._token_path().read_text()
+        except (OSError, ValueError):
+            return None
+        tok = raw.rstrip("\r\n")           # §2: trim the trailing newline
+        return tok or None
+
+    # -- status feed --------------------------------------------------------
+    def set_status(self, **fields) -> None:
+        """Called from the daemon's lifecycle points (on the asyncio loop).
+        Merges into the full status and wakes the sender only on a real change.
+        Never raises — a status update must not be able to disturb the stream."""
+        changed = False
+        for key, value in fields.items():
+            if self._fields.get(key, _MISSING) != value:
+                self._fields[key] = value
+                changed = True
+        if changed:
+            self._dirty.set()
+
+    # -- lifecycle ----------------------------------------------------------
+    async def run(self) -> None:
+        """Reconnect forever with exponential backoff (§8), silently.  Wrapped
+        so no failure here ever escapes into the daemon."""
+        backoff = self.BACKOFF_START
+        while not self._closing:
+            reached_welcome = False
+            try:
+                reached_welcome = await self._session_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:       # pragma: no cover - defensive
+                dbg(f"hub: session crashed ({exc!r})")
+            if self._closing:
+                break
+            if reached_welcome:
+                backoff = self.BACKOFF_START   # §8: reset after a good session
+            try:
+                await asyncio.sleep(backoff)
+            except asyncio.CancelledError:
+                raise
+            backoff = min(backoff * 2, self.BACKOFF_MAX)
+
+    async def _session_once(self) -> bool:
+        """One connect->hello->welcome->serve cycle.  Returns True if we ever
+        reached `welcome` (which resets the backoff)."""
+        tok = self._read_token()
+        if tok is None:
+            return False                   # no hub / no token yet — silent
+        reached_welcome = False
+        welcome = asyncio.Event()
+        session = aiohttp.ClientSession()
+        try:
+            try:
+                ws = await session.ws_connect(self.URL, max_msg_size=self.MAX_FRAME)
+            except Exception as exc:       # refused == no bus is up; be silent
+                dbg(f"hub: connect failed ({exc!r})")
+                return False
+            self._ws = ws
+            try:
+                await ws.send_json(self._hello(tok))   # §3: hello comes first
+            except Exception as exc:
+                dbg(f"hub: hello failed ({exc!r})")
+                return False
+            sender = asyncio.ensure_future(self._sender_loop(ws, welcome))
+            try:
+                async for msg in ws:
+                    if msg.type == WSMsgType.TEXT:
+                        try:
+                            data = json.loads(msg.data)
+                        except ValueError:
+                            continue
+                        if not isinstance(data, dict):
+                            continue
+                        kind = data.get("type")
+                        if kind == "welcome":
+                            reached_welcome = True
+                            welcome.set()
+                        elif kind == "ping":
+                            # §5: liveness — a silent daemon is reaped at 90 s.
+                            try:
+                                await ws.send_json({"type": "pong"})
+                            except Exception:
+                                break
+                        elif kind == "shutdown-request":
+                            # §7: a polite request; exit exactly like SIGTERM.
+                            self._request_shutdown()
+                        elif kind == "error":
+                            dbg(f"hub: error frame: {data.get('message')!r}")
+                        # unknown types are ignored (§3/§6): forward compatible
+                    elif msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSING,
+                                      WSMsgType.CLOSED, WSMsgType.ERROR):
+                        break
+            finally:
+                # Awaiting the sender we just cancelled re-raises its
+                # CancelledError here; that is the *child's* cancellation, not
+                # ours, so swallow it — otherwise it escapes and kills the whole
+                # reconnect loop on the first disconnect.  A genuine shutdown
+                # cancels the run() task and is handled by the _closing check.
+                sender.cancel()
+                try:
+                    await sender
+                except (asyncio.CancelledError, Exception):
+                    pass
+        finally:
+            self._ws = None
+            try:
+                await session.close()
+            except Exception:
+                pass
+        return reached_welcome
+
+    async def _sender_loop(self, ws, welcome: asyncio.Event) -> None:
+        """Waits for welcome, resends the full status once (§8: the hub starts
+        our slot empty), then pushes on change, pre-throttled to <= 4/s."""
+        try:
+            await welcome.wait()
+            loop = asyncio.get_running_loop()
+            await self._flush(ws)          # §8: full resend right after connect
+            while True:
+                await self._dirty.wait()
+                self._dirty.clear()
+                gap = self._last_send + self.MIN_SEND_INTERVAL - loop.time()
+                if gap > 0:
+                    # Coalesce a burst into one send of the latest value, so we
+                    # never rely on the hub silently dropping our excess (§4).
+                    await asyncio.sleep(gap)
+                    self._dirty.clear()
+                await self._flush(ws)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            dbg(f"hub: sender stopped ({exc!r})")
+
+    async def _flush(self, ws) -> None:
+        fields = dict(self._fields)        # send the full merged set every time
+        if not fields:
+            return
+        await ws.send_json({"type": "status", "fields": fields})
+        self._last_send = asyncio.get_running_loop().time()
+
+    def _hello(self, tok: str) -> dict:
+        return {
+            "type": "hello",
+            "app": self.APP_ID,
+            "version": self.version,
+            "pid": os.getpid(),
+            "token": tok,
+            "caps": ["status"],
+        }
+
+    def _request_shutdown(self) -> None:
+        cb = self._on_shutdown_request
+        if cb is None:
+            return
+        try:
+            cb()
+        except Exception as exc:           # pragma: no cover - defensive
+            dbg(f"hub: shutdown callback failed ({exc!r})")
+
+    async def aclose(self) -> None:
+        """Daemon is shutting down: send a best-effort `bye` (§8) and stop."""
+        self._closing = True
+        ws = self._ws
+        if ws is not None and not ws.closed:
+            try:
+                await ws.send_json({"type": "bye"})
+            except Exception:
+                pass
+            try:
+                await ws.close()
+            except Exception:
+                pass
+
+
 # ------------------------------------------------------------- signaling ----
 
 class Daemon:
     """Owns the single-client policy and both event loops' handoffs."""
 
-    def __init__(self, args, injector, on_fatal):
+    def __init__(self, args, injector, on_fatal, hub=None):
         self.args = args
         self.injector = injector
         self.on_fatal = on_fatal
+        self.hub = hub
         self.loop = asyncio.get_running_loop()
         self.streamer = Streamer(args, injector, on_fatal)
         self.client = None
         self.gate = asyncio.Lock()
+
+    # -- hub status ---------------------------------------------------------
+    def _publish_hub(self) -> None:
+        """Push the current session state onto the hub bus.  Called from the
+        attach/detach seams (and once at startup to seed `idle`)."""
+        if self.hub is None:
+            return
+        streaming = self.client is not None
+        self.hub.set_status(
+            state="streaming" if streaming else "idle",
+            client=streaming,
+            # Configured encoder bitrate in Mbps while streaming, 0 when idle.
+            # Real *measured* bitrate is future work — this is the target we ask
+            # the encoder for (args.bitrate is kbps).
+            bitrate=round(self.args.bitrate / 1000.0, 3) if streaming else 0,
+            # latency (glass-to-glass) is deliberately OMITTED: the server does
+            # not currently see the client<->server RTT.  The datachannel
+            # ping/pong is measured on the *client* and never echoed back here,
+            # so sending anything now would be fabricated.  This key lands once
+            # the client reports its measured RTT to the server.
+        )
 
     # -- WS <-> GStreamer ---------------------------------------------------
     def _sender(self, ws):
@@ -1260,6 +1521,9 @@ class Daemon:
                 await self._safe_send(ws, {"type": "error", "message": str(exc)})
                 await ws.close(code=1011, message=b"pipeline failed")
                 self.client = None
+        # Reflect the outcome to the hub: streaming on success, idle if the
+        # pipeline failed above (self.client tells which).
+        self._publish_hub()
 
     async def close_client(self) -> None:
         """Shutdown: hang up on the client ourselves, otherwise aiohttp's
@@ -1282,6 +1546,7 @@ class Daemon:
             await self.loop.run_in_executor(None, self.streamer.stop)
             if self.injector:
                 self.injector.release_all()
+            self._publish_hub()            # back to idle
 
     async def on_message(self, msg) -> None:
         kind = msg.get("type")
@@ -1413,6 +1678,10 @@ def parse_args(argv=None):
                    help="version string the jar expects (default: ask "
                         "'scrcpy --version')")
     p.add_argument("--bind", default="0.0.0.0", help="listen address")
+    p.add_argument("--no-hub", action="store_true",
+                   help="disable the NX Hub connector (status bus). It is "
+                        "enabled by default and stays silent when no hub is "
+                        "running; honours $NX_HUB_DATA_DIR for the token path.")
     args = p.parse_args(argv)
     if args.no_input:
         args.input = "none"
@@ -1458,7 +1727,17 @@ async def serve(args, glib_loop) -> int:
         loop.call_soon_threadsafe(stop.set)
 
     injector = build_injector(args, loop)
-    daemon = Daemon(args, injector, fatal)
+
+    # NX Hub connector: optional, silent, and isolated. A shutdown-request on
+    # the bus must trigger exactly the same clean exit as SIGTERM — set `stop`.
+    hub = None
+    if not args.no_hub:
+        def _hub_shutdown() -> None:
+            log("shutdown-request from NX Hub — shutting down")
+            stop.set()
+        hub = HubConnector(version=VERSION, on_shutdown_request=_hub_shutdown)
+
+    daemon = Daemon(args, injector, fatal, hub=hub)
     try:
         runner = web.AppRunner(daemon.build_app(), access_log=None,
                                shutdown_timeout=5.0)
@@ -1479,7 +1758,27 @@ async def serve(args, glib_loop) -> int:
     log(f"capturing {args.output} on WAYLAND_DISPLAY={args.wayland_display} "
         f"at {args.width}x{args.height}@{args.fps}, {args.bitrate} kbps")
 
+    # Seed the hub with our initial state (idle), then let it reconnect forever
+    # in the background. It never blocks or crashes the streamer if absent.
+    hub_task = None
+    if hub is not None:
+        daemon._publish_hub()
+        hub_task = asyncio.ensure_future(hub.run())
+
     await stop.wait()
+
+    # Say goodbye to the hub first (best-effort) and stop its reconnect loop.
+    if hub is not None:
+        try:
+            await hub.aclose()
+        except Exception as exc:          # pragma: no cover - defensive
+            dbg(f"hub: aclose failed ({exc!r})")
+        if hub_task is not None:
+            hub_task.cancel()
+            try:
+                await hub_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
     # Order matters: stop the injector retrying and hang up on the client
     # first, so neither can stretch the shutdown out.
