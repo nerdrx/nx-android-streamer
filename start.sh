@@ -374,7 +374,9 @@ cmd_ref() {
 }
 
 # ----------------------------------------------------------------- main ----
-case "${1:-help}" in
+# Bare invocation means "serve". NX Hub launches the binHint with no arguments,
+# and a usage-and-exit-1 there reads to the user as "Launch does nothing".
+case "${1:-serve}" in
     setup)  cmd_setup ;;
     arm)    cmd_arm ;;
     up)     cmd_up ;;
