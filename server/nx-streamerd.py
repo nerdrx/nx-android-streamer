@@ -370,10 +370,16 @@ class Streamer:
             f"framerate={a.fps}/1 "
             f"! videoconvert n-threads=4 "
             f"! {self.encoder_name} name=venc "
+            # Android's libwebrtc only negotiates H.264 constrained-baseline; a
+            # High-profile offer (VAAPI's default, profile-level-id=640033) makes
+            # it answer m=video 0 and reject the video outright. Browsers accept
+            # High, which is why the web client worked and the phone showed a
+            # black screen. Force the profile every client can actually decode.
+            f"! video/x-h264,profile=constrained-baseline "
             f"! h264parse config-interval=-1 "
             f"! rtph264pay name=pay pt=96 "
             f"! application/x-rtp,media=video,encoding-name=H264,payload=96 "
-            f"! webrtcbin name=webrtc bundle-policy=max-bundle"
+            f"! webrtcbin name=webrtc bundle-policy=max-compat"
         )
 
     def start(self, send_json) -> None:

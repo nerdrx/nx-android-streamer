@@ -19,7 +19,7 @@ try:
     from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor, QRadialGradient, QAction, QFont
     from PySide6.QtWidgets import (
         QApplication, QSystemTrayIcon, QMenu, QWidget, QVBoxLayout, QHBoxLayout,
-        QPushButton, QLabel, QLineEdit, QGridLayout, QFrame, QSizePolicy,
+        QPushButton, QLabel, QLineEdit, QGridLayout, QFrame, QSizePolicy, QPlainTextEdit,
     )
 except ImportError:
     sys.stderr.write(
@@ -220,11 +220,27 @@ class Panel(QWidget):
         brow.addWidget(doctor); brow.addWidget(browser)
         outer.addLayout(brow)
 
+        # Live log. Without this the panel is a black box: "nothing happened"
+        # and "it died three seconds ago" look identical.
+        self.log_view = QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setMaximumBlockCount(400)
+        self.log_view.setFixedHeight(120)
+        self.log_view.setStyleSheet(
+            f"background:#08080f; color:{DIM}; border:1px solid #20203a;"
+            "border-radius:8px; font-family:monospace; font-size:11px;"
+        )
+        self.log_view.setPlaceholderText("log output appears here once you press Start…")
+        outer.addWidget(self.log_view)
+
         hide = QPushButton("Close to tray")
         hide.clicked.connect(self.hide)
         outer.addWidget(hide)
 
         self.refresh_qr()
+
+    def log(self, line):
+        self.log_view.appendPlainText(line.rstrip())
 
     def refresh_qr(self):
         addr = self.app.addr
@@ -329,6 +345,7 @@ class TrayApp:
             return
         chunk = bytes(self.proc.readAllStandardOutput()).decode("utf-8", "replace")
         for line in chunk.splitlines():
+            self.panel.log(line)
             low = line.lower()
             if "client" in low and "connected" in low and "gone" not in low:
                 self.set_state("client")

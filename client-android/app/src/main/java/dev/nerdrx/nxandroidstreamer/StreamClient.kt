@@ -158,8 +158,15 @@ class StreamClient(
         val rtcConfig = PeerConnection.RTCConfiguration(emptyList()).apply {
             sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
             continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
-            bundlePolicy = PeerConnection.BundlePolicy.MAXBUNDLE
-            rtcpMuxPolicy = PeerConnection.RtcpMuxPolicy.REQUIRE
+            // GStreamer's webrtcbin offers the datachannel as a bundle-only
+            // m=application section, and that section carries no a=rtcp-mux (SCTP
+            // has no RTCP). libwebrtc with RtcpMuxPolicy.REQUIRE applies the mux
+            // check to EVERY bundled section, so applying our own answer fails with
+            // "Failed to setup RTCP mux" on mid=application1. Browsers don't do this
+            // check, which is why the web client works against the same offer.
+            // NEGOTIATE relaxes it; MAXBUNDLE requires REQUIRE, so drop to BALANCED.
+            bundlePolicy = PeerConnection.BundlePolicy.BALANCED
+            rtcpMuxPolicy = PeerConnection.RtcpMuxPolicy.NEGOTIATE
         }
 
         val peer = factory.createPeerConnection(rtcConfig, PcObserver(myGen))
@@ -256,10 +263,17 @@ class StreamClient(
         val candidate = msg.optString("candidate")
         if (candidate.isNullOrEmpty()) return          // tolerate end-of-candidates
         val mlineIndex = msg.optInt("sdpMLineIndex", 0)
-        // The frozen protocol carries no sdpMid; libwebrtc resolves by mline index.
-        val ice = IceCandidate(null, mlineIndex, candidate)
+        // The frozen protocol carries no sdpMid, and libwebrtc resolves by mline
+        // index — but the sdpMid MUST NOT be null: it goes straight into JNI as a
+        // String, and a null there aborts the whole process (SIGABRT inside
+        // nativeAddIceCandidate). Empty string is the correct "no mid".
+        val ice = IceCandidate("", mlineIndex, candidate)
         // Candidates can arrive before setRemoteDescription resolves; libwebrtc queues them.
-        pc?.addIceCandidate(ice)
+        try {
+            pc?.addIceCandidate(ice)
+        } catch (e: Exception) {
+            Log.w(TAG, "addIceCandidate failed: ${e.message}")
+        }
     }
 
     private fun send(obj: JSONObject) {
