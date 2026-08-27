@@ -94,6 +94,7 @@ class StreamClient(
     // Last quality settings the user chose; re-sent on every (re)connect so the
     // server always matches the phone's UI, including after a drop.
     private var pendingConfig: Triple<Int, Int, Boolean>? = null
+    private var connectStartedAt = 0L
 
     private val pingRunnable = object : Runnable {
         override fun run() {
@@ -116,6 +117,16 @@ class StreamClient(
      *  came back). Mirrors app.js reconnectNow(). */
     fun reconnectNow() {
         if (stopped) return
+        // Startup fires three of these in a row (onCreate autoconnect, onResume,
+        // and the network-available callback). Each one opened a NEW websocket,
+        // and the server keeps a single client — so every attempt evicted the
+        // one before it and the survivor was torn down mid-negotiation. Skip a
+        // redundant reconnect while a young attempt is still in flight.
+        val inFlight = System.currentTimeMillis() - connectStartedAt
+        if (isHealthy() || (lastPhase == Phase.CONNECTING && inFlight < ATTEMPT_GRACE_MS)) {
+            Log.d(TAG, "reconnectNow ignored (attempt in flight)")
+            return
+        }
         main.removeCallbacks(retryDelayed)
         retryScheduled = false
         retryDelayMs = RECONNECT_MIN_MS
@@ -172,6 +183,7 @@ class StreamClient(
         teardown()                       // paranoia: never run two sessions
         val myGen = ++gen
         attempts++
+        connectStartedAt = System.currentTimeMillis()
 
         // First attempt reads "connecting…"; anything after a failure "reconnecting…".
         setPhase(if (attempts == 1) Phase.CONNECTING else Phase.RECONNECTING)
@@ -605,6 +617,8 @@ class StreamClient(
     }
 
     companion object {
+        /** How long one connection attempt is given before another may preempt it. */
+        private const val ATTEMPT_GRACE_MS = 8000L
         private const val TAG = "nx"
         private const val RECONNECT_MIN_MS = 500L
         private const val RECONNECT_MAX_MS = 5000L
