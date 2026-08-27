@@ -35,6 +35,7 @@ cmd_setup() {
     need grim        || pkgs+=(grim)
     need vainfo      || pkgs+=(libva-utils)
     need adb         || pkgs+=(android-tools)      # touch injection reaches android over adb
+    need socat       || pkgs+=(socat)              # doctor's netns adb bridge fallback
     [[ -f /usr/share/scrcpy/scrcpy-server ]] || pkgs+=(scrcpy)  # its server jar, control-only
     # probe actual elements, not gst-launch — the core can be present while
     # the plugin packages that matter (rtph264pay, vah264enc) are not
@@ -177,9 +178,18 @@ cmd_doctor() {
     # key so touch injection needs no accept-tap inside an invisible session.
     local wip=192.168.240.112 gw=192.168.240.1
     waydroid status 2>/dev/null | grep -q "Session:.*RUNNING" || die "session not running — ./start.sh up first"
+    # everything below is mirrored into .run/doctor.log so the output survives
+    # the terminal (and can be read by whoever is debugging remotely)
+    exec > >(tee "$RUN/doctor.log") 2>&1
 
-    log "inside view of eth0:"
-    sudo waydroid shell -- /system/bin/sh -c 'ip addr show eth0 2>/dev/null; ip route 2>/dev/null' || die "waydroid shell failed"
+    log "inside view of the network stack:"
+    sudo waydroid shell -- /system/bin/sh -c \
+        'ip link; echo --; ip addr show eth0 2>/dev/null; echo --; ip route; echo --;
+         getprop init.svc.netd; getprop init.svc.zygote; getprop sys.boot_completed' \
+        || die "waydroid shell failed"
+    log "last ethernet/dhcp lines from logcat:"
+    sudo waydroid shell -- /system/bin/sh -c \
+        'logcat -d -t 400 2>/dev/null | grep -iE "EthernetTracker|EthernetNetworkFactory|dhcp|eth0" | tail -15' || true
 
     if ! sudo waydroid shell -- /system/bin/sh -c 'ip addr show eth0 2>/dev/null' | grep -q 'inet '; then
         log "eth0 has no IPv4 — applying static config $wip/24 via $gw"
@@ -188,6 +198,12 @@ cmd_doctor() {
             ip addr add $wip/24 dev eth0 2>/dev/null || true
             ip route add default via $gw 2>/dev/null || true
             setprop net.eth0.dns1 $gw"
+        sleep 3
+        if sudo waydroid shell -- /system/bin/sh -c 'ip addr show eth0' | grep -q "inet $wip"; then
+            log "  static config held ✓"
+        else
+            log "  static config was FLUSHED (android's netd is fighting us) — will bridge adb instead"
+        fi
     fi
 
     log "connectivity from inside:"
@@ -209,8 +225,31 @@ cmd_doctor() {
     sleep 2
     if adb connect "$wip:5555" 2>/dev/null | grep -q connected; then
         log "adb: connected to $wip:5555 ✓ (boot_completed=$(adb -s "$wip:5555" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r'))"
+        return
+    fi
+
+    # Plan B: the container's IP stack is broken, but adbd listens inside the
+    # container's netns and the container's /data is a host directory. So:
+    # one socat with its NETWORK in the container (nsenter -n) but its
+    # FILESYSTEM on the host relays a host unix socket to in-container
+    # 127.0.0.1:5555; a second, plain socat exposes that as host tcp/15555.
+    # adb (and the streamer) then use 127.0.0.1:15555 — no container IP needed.
+    log "adb: direct connect failed — building netns adb bridge on 127.0.0.1:15555"
+    need socat || die "socat needed for the adb bridge: sudo pacman -S socat, then re-run doctor"
+    local apid sock=/run/nxas-adb.sock
+    apid=$(pgrep -of '/apex/com.android.adbd/bin/adbd') || die "no adbd process found in container"
+    sudo pkill -f "UNIX-LISTEN:$sock" 2>/dev/null || true
+    pkill -f "UNIX-CONNECT:$sock" 2>/dev/null || true
+    sudo rm -f "$sock"
+    sudo nohup nsenter -t "$apid" -n socat "UNIX-LISTEN:$sock,fork,mode=666" TCP:127.0.0.1:5555 >/dev/null 2>&1 &
+    sleep 1
+    nohup socat TCP-LISTEN:15555,bind=127.0.0.1,reuseaddr,fork "UNIX-CONNECT:$sock" >/dev/null 2>&1 &
+    sleep 1
+    if adb connect 127.0.0.1:15555 2>/dev/null | grep -q connected; then
+        log "adb: bridged ✓ 127.0.0.1:15555 (boot_completed=$(adb -s 127.0.0.1:15555 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r'))"
+        log "stream with: ./start.sh stream --adb-serial 127.0.0.1:15555"
     else
-        log "adb: could not connect — re-run doctor once Android finishes booting"
+        log "adb: bridge failed too — read $RUN/doctor.log and phone a friend"
     fi
 }
 
