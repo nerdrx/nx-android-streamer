@@ -137,7 +137,14 @@ class StreamClient(
         // one before it and the survivor was torn down mid-negotiation. Skip a
         // redundant reconnect while a young attempt is still in flight.
         val inFlight = System.currentTimeMillis() - connectStartedAt
-        if (isHealthy() || (lastPhase == Phase.CONNECTING && inFlight < ATTEMPT_GRACE_MS)) {
+        // The grace has to cover RECONNECTING as well: phase is only CONNECTING on
+        // the very first attempt, so after any failure a wake-up would preempt the
+        // in-flight attempt again — pong watchdog, then onResume, then the network
+        // callback, each opening a socket that evicts the last one server-side.
+        // A machine parked in backoff (retryScheduled) SHOULD be preempted now.
+        val attemptInFlight = !retryScheduled &&
+            (lastPhase == Phase.CONNECTING || lastPhase == Phase.RECONNECTING)
+        if (isHealthy() || (attemptInFlight && inFlight < ATTEMPT_GRACE_MS)) {
             Log.d(TAG, "reconnectNow ignored (attempt in flight)")
             return
         }

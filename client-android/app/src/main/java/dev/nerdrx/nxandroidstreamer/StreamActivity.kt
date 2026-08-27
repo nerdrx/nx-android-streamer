@@ -310,7 +310,12 @@ class StreamActivity : AppCompatActivity(), StreamClient.Listener, StreamView.Ca
         applyKeepAwake()
         acquireWake()
 
+        // stop() emits no phase change, so the bridges never hear about a
+        // server switch — an in-flight picker upload would keep streaming its
+        // chunks into the NEW session's signaling socket. Tear them down here.
         client?.stop()
+        pickerBridge.abort()
+        cameraBridge.onSessionEnded()
         client = StreamClient(
             factory = factory,
             renderer = streamView.renderer,
@@ -322,6 +327,12 @@ class StreamActivity : AppCompatActivity(), StreamClient.Listener, StreamView.Ca
             // Seed the user's quality choices before connecting; the client
             // re-sends them whenever the socket (re)opens.
             it.sendConfig(prefsImpl.bitrateKbps, prefsImpl.fps, prefsImpl.adaptiveBitrate)
+            // Seed the camera want too: only the Settings toggle used to send
+            // this, so enabling the camera and then restarting the app (or the
+            // daemon) left the toggle ON while the server stayed at "none"
+            // forever. want=false is a no-op server-side, so this is safe for
+            // everyone who leaves the camera off.
+            it.sendCameraWant(prefsImpl.allowRemoteCamera)
             it.start()
         }
         // After the client exists, so the first reading has somewhere to go —

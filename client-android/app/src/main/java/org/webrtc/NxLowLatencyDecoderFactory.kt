@@ -108,14 +108,23 @@ class NxLowLatencyDecoderFactory(
             if (colorFormat != null) {
                 Log.d(TAG, "low-latency hardware decoder: ${info.name} " +
                     "for ${codec.name} (colorFormat=$colorFormat)")
-                return AndroidVideoDecoder(
+                val hw = AndroidVideoDecoder(
                     LowLatencyCodecFactory(), info.name, mime, colorFormat, eglContext
                 )
+                // Wrapped so a decoder that ENUMERATES fine but fails at runtime
+                // (a vendor that chokes on the low-latency keys, or dies under
+                // load) falls back to software instead of leaving the video black
+                // forever while audio and touch keep working. The bare decoder
+                // only ever reported an error upward and nothing retried.
+                val sw = software.createDecoder(codec)
+                return if (sw != null) VideoDecoderFallback(sw, hw) else hw
             }
             Log.w(TAG, "${info.name} exposes no supported colour format; using default path")
         }
         Log.d(TAG, "no low-latency path for ${codec.name}; falling back")
-        return hardware.createDecoder(codec) ?: software.createDecoder(codec)
+        val hw = hardware.createDecoder(codec) ?: return software.createDecoder(codec)
+        val sw = software.createDecoder(codec)
+        return if (sw != null) VideoDecoderFallback(sw, hw) else hw
     }
 
     override fun getSupportedCodecs(): Array<VideoCodecInfo> {

@@ -57,6 +57,10 @@ class PickerBridge(
     /** The request we are currently serving. One at a time, by construction: the
      *  picker is a modal activity and the container is waiting on exactly one. */
     private var pendingId: String? = null
+    // Read by the upload worker every chunk. quitSafely() cannot interrupt a
+    // Runnable that is already executing, so without this an aborted pick keeps
+    // encoding and posts its remaining frames onto the NEXT session's socket.
+    @Volatile private var uploadingId: String? = null
     private var pendingSpool: String? = null
 
     // ---------------------------------------------------------------------
@@ -98,6 +102,7 @@ class PickerBridge(
         val id = pendingId ?: return
         Log.d(TAG, "pick $id aborted (session ended)")
         sendCancel(id, pendingSpool)
+        uploadingId = null          // tells an in-flight upload to stop now
         pendingId = null
         pendingSpool = null
         worker?.quitSafely()
@@ -142,6 +147,7 @@ class PickerBridge(
         val mime = resolver.getType(uri) ?: "application/octet-stream"
         Log.d(TAG, "uploading $name ($mime, ${declared ?: -1} bytes) for pick $id")
 
+        uploadingId = id
         val digest = MessageDigest.getInstance("SHA-256")
         var sent = 0L
         var seq = 0
@@ -179,7 +185,12 @@ class PickerBridge(
                         frame.put("size", sent)
                         frame.put("sha256", digest.digest().joinToString("") { "%02x".format(it) })
                     }
+                    if (uploadingId != id) {
+                        Log.d(TAG, "pick $id cancelled mid-upload; dropping the rest")
+                        return
+                    }
                     awaitBacklog()
+                    if (uploadingId != id) return
                     main.post { client()?.sendBridgeFrame(frame) }
                     seq++
                     if (eof) break
@@ -190,6 +201,7 @@ class PickerBridge(
             Log.e(TAG, "pick $id upload failed: ${e.message}")
             sendCancel(id, pendingSpool)
         } finally {
+            if (uploadingId == id) uploadingId = null
             main.post {
                 if (pendingId == id) {
                     pendingId = null

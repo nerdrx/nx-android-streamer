@@ -3045,11 +3045,13 @@ class Daemon:
                 return web.FileResponse(target, headers=NO_STORE)
 
             app.router.add_get("/", serve_index)
-            # Registered last: both of these are catch-alls.
-            try:
-                app.router.add_static("/", str(root), show_index=False)
-            except (ValueError, AssertionError):  # aiohttp dislikes a "/" prefix
-                app.router.add_get("/{path:.*}", serve_file)
+            # Always our own handler, never add_static: aiohttp accepts a "/"
+            # prefix on current versions, and its static handler sends no
+            # Cache-Control at all. That silently defeated NO_STORE for
+            # app.js/style.css/manifest.json — only index.html was covered — so a
+            # phone could keep running a days-old app.js and re-hit bugs that
+            # were already fixed. serve_file resolves paths safely itself.
+            app.router.add_get("/{path:.*}", serve_file)
             log(f"http: serving {root}")
         else:
             warn(f"http: no index.html under {root} — serving a placeholder. "
