@@ -237,11 +237,31 @@ cmd_stream() {
     log "phone client (browser): http://$addr:$port"
     [[ -n $avahi_pid ]] && log "mDNS: advertising _nxstream._tcp on $port ✓"
 
+    # Audio and camera are on by default — they are features of "your phone",
+    # not opt-in extras you have to remember a flag for. Both degrade quietly:
+    # --audio auto builds its own private sink and falls back to silence, and a
+    # missing/absent camera node just leaves the SDP unchanged.
+    # NXAS_AUDIO=none / NXAS_CAMERA=none turn them off.
+    local audio camera
+    audio=${NXAS_AUDIO:-auto}
+    camera=${NXAS_CAMERA:-}
+    if [[ -z $camera ]]; then
+        # First v4l2loopback node the container can also see, else nothing.
+        for n in /dev/video*; do
+            if v4l2-ctl -d "$n" --info 2>/dev/null | grep -qi 'v4l2 loopback'; then
+                camera=$n; break
+            fi
+        done
+        camera=${camera:-none}
+    fi
+    log "audio: $audio   camera: $camera"
+
     python "$ROOT/server/nx-streamerd.py" \
         --wayland-display "$disp" \
         --width "$W" --height "$H" --fps "$fps" \
         --bitrate "${NXAS_BITRATE:-8000}" \
         --min-bitrate "${NXAS_MIN_BITRATE:-1500}" \
+        --audio "$audio" --camera "$camera" \
         --port "$port" "$@"
     [[ -n "$avahi_pid" ]] && kill "$avahi_pid" 2>/dev/null || true
 }
