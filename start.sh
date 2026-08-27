@@ -313,6 +313,24 @@ cmd_doctor() {
             && log "density set to ${DPI}dpi ✓" || true
     fi
 
+    # ufw again, this time for the stream itself: a default-deny INPUT policy
+    # lets the tailnet through but drops LAN clients, so the phone times out on
+    # the LAN profile while tailscale works — and the symptom reads as "slow"
+    # or "frozen" rather than "blocked".
+    if need ufw && sudo ufw status 2>/dev/null | grep -q "Status: active"; then
+        local lan
+        lan=$(ip -4 -o addr show scope global 2>/dev/null \
+              | grep -v tailscale | awk '{print $4}' | head -1)
+        if [[ -n $lan ]]; then
+            local subnet=${lan%.*.*}    # a.b.c.d/24 -> a.b
+            subnet=$(python -c "import ipaddress,sys;print(ipaddress.ip_network('$lan',strict=False))" 2>/dev/null || echo "")
+            if [[ -n $subnet ]] && ! sudo ufw status | grep -q "$subnet"; then
+                log "ufw is active and would drop LAN clients — allowing $subnet"
+                sudo ufw allow from "$subnet" to any
+            fi
+        fi
+    fi
+
     log "authorizing host adb key + enabling adbd on tcp/5555..."
     [[ -f $HOME/.android/adbkey.pub ]] || { log "  generating adb key..."; adb keygen "$HOME/.android/adbkey" >/dev/null 2>&1 || true; adb start-server >/dev/null 2>&1 || true; }
     [[ -f $HOME/.android/adbkey.pub ]] || die "no $HOME/.android/adbkey.pub — install android-tools and run 'adb start-server' once"
