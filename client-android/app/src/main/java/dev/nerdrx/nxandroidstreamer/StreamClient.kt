@@ -107,6 +107,7 @@ class StreamClient(
     // Null while mirroring is off.
     private var pendingBattery: Pair<Int, Boolean>? = null
     private var connectStartedAt = 0L
+    private var pendingCameraWant: Boolean? = null
 
 
     private val pingRunnable = object : Runnable {
@@ -182,6 +183,17 @@ class StreamClient(
      * device reads as the one in your hand. Same rules as [sendConfig]: safe
      * before the socket exists, and re-sent on every reconnect.
      */
+    /**
+     * Ask the host to add (or drop) the camera m-section. It is NOT in the
+     * first offer on purpose: android's libwebrtc fails the whole answer on an
+     * offered recvonly video section, so the host only adds one — via a
+     * re-offer — once the user has actually allowed the camera.
+     */
+    fun sendCameraWant(want: Boolean) {
+        pendingCameraWant = want
+        sendSignal(JSONObject().put("type", "camera").put("want", want), "camera")
+    }
+
     fun sendBattery(level: Int, charging: Boolean) {
         val state = Pair(level.coerceIn(0, 100), charging)
         pendingBattery = state
@@ -271,6 +283,7 @@ class StreamClient(
                     if (myGen != gen) return@post
                     Log.d(TAG, "ws open, waiting for offer")
                     pendingConfig?.let { (b, f, a) -> sendConfig(b, f, a) }
+                    pendingCameraWant?.let { sendCameraWant(it) }
                     pendingBattery?.let { (l, c) -> sendBattery(l, c) }
                 }
             }
@@ -584,7 +597,8 @@ class StreamClient(
     private fun traceInput(eventTimeMs: Long, d: DataChannel) {
         val age = android.os.SystemClock.uptimeMillis() - eventTimeMs
         val queued = try { d.bufferedAmount() } catch (e: Exception) { -1L }
-        Log.d(TAG, "input trace: event->send ${age}ms, dc queued ${queued}B")
+        if (!Log.isLoggable(TAG, Log.VERBOSE)) return
+        Log.v(TAG, "input trace: event->send ${age}ms, dc queued ${queued}B")
     }
 
     private fun sendInput(obj: JSONObject, eventTimeMs: Long = 0L) {

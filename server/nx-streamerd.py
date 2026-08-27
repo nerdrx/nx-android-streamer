@@ -1439,7 +1439,7 @@ class Streamer:
                                        None if y is None else float(y))
             if kind == "td":
                 dt = (time.perf_counter() - t0) * 1000.0
-                log(f"input trace: recv->inject {dt:.2f}ms ({kind})")
+                dbg(f"input trace: recv->inject {dt:.2f}ms ({kind})")
         except Exception as exc:
             warn(f"input: {kind} failed: {exc}")
 
@@ -2772,6 +2772,20 @@ class Daemon:
         self._bad_config_fields.add(key)
         warn(f"config: ignoring bad {key!r} from the client ({raw!r})")
 
+    async def on_camera_want(self, ws, want: bool) -> None:
+        """Turn the phone-camera path on or off for the live session."""
+        if self.client is not ws:
+            return
+        spec = "auto" if want else "none"
+        if getattr(self.args, "camera", "none") == spec:
+            return                                   # already in that state
+        self.args.camera = spec
+        log(f"camera: client asked for {'on' if want else 'off'} — re-offering")
+        if not await self._rebuild(ws):
+            err("camera: rebuild failed; reverting to no camera")
+            self.args.camera = "none"
+            await self._rebuild(ws)
+
     async def on_config(self, ws, msg) -> None:
         """{"type":"config", bitrate?, fps?, abr?} from the phone.
 
@@ -2921,6 +2935,14 @@ class Daemon:
             # to set bitrate/fps before (or without) the datachannel ever
             # opening, and the datachannel stays input-only.
             await self.on_config(ws, msg)
+        elif kind == "camera" and "want" in msg:
+            # On-demand camera. The recvonly m=video CANNOT be in the first
+            # offer: android's libwebrtc fails setLocalDescription on it and
+            # takes video and audio down with it, whether the client claims the
+            # section or declines it. So the section only exists once the user
+            # actually turns the camera on, and we get there by rebuilding and
+            # re-offering — the same proven path an fps change uses.
+            await self.on_camera_want(ws, bool(msg.get("want")))
         elif kind == "battery":
             # Fire-and-forget on purpose. Mirroring costs three adb round trips
             # and the first one can sit in an `adb connect` for seconds; an

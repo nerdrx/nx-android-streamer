@@ -99,8 +99,17 @@ Tailscale/WireGuard — the signaling server never listens on the open internet)
 and add it to the home screen. One client at a time; the newest wins.
 
 Geometry is overridable: `NXAS_WIDTH/NXAS_HEIGHT/NXAS_HZ` (defaults 1080/2400/90,
-i.e. a Pixel 7). The streamer also takes `NXAS_FPS` (60), `NXAS_BITRATE` (8000
-kbps), `NXAS_MIN_BITRATE` (1500 kbps) and `NXAS_PORT` (8765).
+i.e. a Pixel 7) and `NXAS_DPI` (420 — waydroid's own 180 renders every control
+at tablet scale). The streamer also takes `NXAS_FPS` (60), `NXAS_BITRATE` (8000
+kbps ceiling), `NXAS_MIN_BITRATE` (1500), `NXAS_PORT` (8765), `NXAS_AUDIO`
+(`auto`) and `NXAS_CAMERA` (`none` — the phone asks for it at runtime).
+
+**Sound is on by default.** Waydroid has no monitor source of its own, so the
+daemon creates a private null sink, moves only Waydroid's streams into it and
+captures that — your desktop audio is never captured and never altered.
+
+**Framerate:** 60 is the practical ceiling. The wlroots capture tops out near
+80 fps, so asking for 90 measures ~58 and buys nothing.
 
 `NXAS_BITRATE` is a **ceiling**, not a fixed rate: the daemon watches RTCP loss
 and round-trip time and moves the encoder between `NXAS_MIN_BITRATE` and that

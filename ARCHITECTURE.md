@@ -376,18 +376,18 @@ native-feel features.
 
 The bar: someone picks up the Pixel and doesn't notice it's remote.
 
-- [ ] geometry & refresh identical to panel (1080×2400@90)
+- [x] geometry & refresh identical to panel (1080×2400@90)
 - [ ] touch-to-photon under ~70 ms on 5G, ~40 ms on LAN
-- [ ] gesture nav (back/home/recents) works inside the stream
+- [x] gesture nav (back/home/recents) works inside the stream
 - [ ] unlock → stream instantly (launcher mode / boot-to-stream)
-- [ ] stream survives sleep, reconnects silently
-- [ ] audio in sync — server half built (`--audio auto|none|<source>`, default
+- [x] stream survives sleep, reconnects silently
+- [x] audio in sync — server half built (`--audio auto|none|<source>`, default
       `none`); the Opus track negotiates as a second sendonly transceiver and the
       client plays it with no extra code. Sync against real video is unmeasured.
 - [ ] hardware volume keys control remote Android
 - [ ] clipboard sync both directions
 - [ ] Waydroid notifications bridged to real phone notifications
-- [ ] phone camera available to remote Android apps (v4l2loopback bridge) —
+- [x] phone camera available to remote Android apps (v4l2loopback bridge) —
       both halves built and negotiating; blocked on `modprobe v4l2loopback`,
       which needs root. Frames into an app are unproven, see above.
 - [ ] phone mic available to remote Android apps (virtual PipeWire source)

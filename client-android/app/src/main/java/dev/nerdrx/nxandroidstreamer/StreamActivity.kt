@@ -450,7 +450,12 @@ class StreamActivity : AppCompatActivity(), StreamClient.Listener, StreamView.Ca
 
     // nx-bridge: the remote-camera opt-in. The server is told whether it *may*
     // ask; it answers with whether it is asking, and only then do we capture.
-    override fun onCameraAllowChanged(allow: Boolean) = cameraBridge.onAllowChanged(allow)
+    override fun onCameraAllowChanged(allow: Boolean) {
+        cameraBridge.onAllowChanged(allow)
+        // The host adds the camera m-section only on request; without this the
+        // toggle would do nothing until the next reconnect.
+        client?.sendCameraWant(allow)
+    }
     override fun cameraStatus(): String? = cameraBridge.statusText()
 
     override fun onBatteryMirrorChanged() = applyBatteryMirror()
