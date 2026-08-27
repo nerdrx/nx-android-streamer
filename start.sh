@@ -227,7 +227,21 @@ cmd_stream() {
             "addr=$addr" "w=$W" "h=$H" >/dev/null 2>&1 &
         avahi_pid=$!
     fi
-    trap '[[ -n "$avahi_pid" ]] && kill "$avahi_pid" 2>/dev/null; exit 0' INT TERM
+    # Forward signals to the daemon, don't just absorb them. bash defers a trap
+    # until the foreground child exits, so terminating THIS script (what the
+    # tray's Stop and any service manager do) previously left nx-streamerd
+    # running as an orphan — still holding port 8765, still holding the battery
+    # override, the pulse sink and the scrcpy server — and the next Start died
+    # on "address already in use". Ctrl-C only appeared to work because the tty
+    # signals the whole process group.
+    nxas_py_pid=""
+    nxas_shutdown() {
+        [[ -n $nxas_py_pid ]] && kill -TERM "$nxas_py_pid" 2>/dev/null
+        [[ -n $avahi_pid ]] && kill "$avahi_pid" 2>/dev/null
+        wait "$nxas_py_pid" 2>/dev/null
+        exit 0
+    }
+    trap nxas_shutdown INT TERM
 
     log "streaming ${W}x${H}@${fps} from $disp on port $port — Ctrl-C to stop"
     if need qrencode && [[ $addr != "<pc-address>" ]]; then
@@ -252,13 +266,17 @@ cmd_stream() {
     camera=${NXAS_CAMERA:-none}
     log "audio: $audio   camera: $camera"
 
+    # Backgrounded + wait, so the trap above can actually run while the daemon
+    # is alive (a foreground child would block it until it exited anyway).
     python "$ROOT/server/nx-streamerd.py" \
         --wayland-display "$disp" \
         --width "$W" --height "$H" --fps "$fps" \
         --bitrate "${NXAS_BITRATE:-8000}" \
         --min-bitrate "${NXAS_MIN_BITRATE:-1500}" \
         --audio "$audio" --camera "$camera" \
-        --port "$port" "$@"
+        --port "$port" "$@" &
+    nxas_py_pid=$!
+    wait "$nxas_py_pid"
     [[ -n "$avahi_pid" ]] && kill "$avahi_pid" 2>/dev/null || true
 }
 

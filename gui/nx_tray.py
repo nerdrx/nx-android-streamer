@@ -40,7 +40,7 @@ ACCENT = "#7700FF"
 TEXT = "#e8e8f0"
 DIM = "#8a8a9a"
 
-DEFAULTS = {"width": 1080, "height": 2400, "hz": 90, "fps": 60, "bitrate": 12000, "port": 8765}
+DEFAULTS = {"width": 1080, "height": 2400, "hz": 90, "fps": 60, "bitrate": 8000, "port": 8765}
 
 
 def load_cfg():

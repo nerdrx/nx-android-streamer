@@ -26,6 +26,7 @@ import asyncio
 import errno
 import fcntl
 import json
+import math
 import os
 import random
 import shutil
@@ -235,6 +236,9 @@ class Capture:
         if self._stopping:
             log(f"capture: wf-recorder exited (rc={rc}) during shutdown")
             return
+        # Before anything else: a pipeline still blocked opening the fifo must
+        # be released, or the teardown this death triggers will deadlock.
+        self._unblock_fifo_open()
         err(f"capture: wf-recorder DIED unexpectedly (rc={rc}) — no more frames.")
         err("capture: usual causes: session gone, wrong --output name, "
             "WAYLAND_DISPLAY mismatch. Check './start.sh status' and .run/sway.log")
@@ -242,6 +246,26 @@ class Capture:
 
     def alive(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
+
+    def _unblock_fifo_open(self) -> None:
+        """Let a blocked filesrc open() return.
+
+        If wf-recorder dies before it ever opens the write end, filesrc's open()
+        on the fifo blocks in the kernel forever — inside set_state(PLAYING), on
+        an executor thread, holding Streamer._lock. The watchdog then calls
+        stop(), which wants that same lock, and the daemon becomes an unkillable
+        zombie still holding the port: SIGTERM does nothing (the handler only
+        re-sets an already-set event) and the next `serve` dies on bind.
+
+        Opening the write end ourselves for an instant is enough: the open
+        returns, filesrc reads EOF, and the normal EOS teardown proceeds.
+        """
+        try:
+            fd = os.open(str(self.fifo), os.O_WRONLY | os.O_NONBLOCK)
+        except OSError:
+            return          # nobody is waiting, or the fifo is already gone
+        else:
+            os.close(fd)
 
     def stop(self) -> None:
         self._stopping = True
@@ -252,6 +276,7 @@ class Capture:
             # its signal handler. There is nothing to finalize — the "file" is
             # a pipe we are about to delete — so waiting longer buys nothing.
             log("capture: stopping wf-recorder")
+            self._unblock_fifo_open()
             try:
                 self.proc.send_signal(signal.SIGINT)
                 self.proc.wait(timeout=0.7)
@@ -1145,7 +1170,26 @@ class Streamer:
     def _start(self, send_json) -> None:
         with self._lock:
             self.send_json = send_json
-            fifo = Path(self.args.run_dir) / f"nxas-cap-{os.getpid()}.raw"
+            # Sweep fifos left by daemons that were killed hard — they are
+            # named by pid, so anything whose pid is gone is debris. Seven had
+            # piled up before this existed.
+            run_dir = Path(self.args.run_dir)
+            for old_fifo in run_dir.glob("nxas-cap-*.raw"):
+                try:
+                    pid = int(old_fifo.stem.rsplit("-", 1)[1])
+                except (ValueError, IndexError):
+                    continue
+                if pid == os.getpid():
+                    continue
+                try:
+                    os.kill(pid, 0)          # still running: leave it alone
+                except ProcessLookupError:
+                    old_fifo.unlink(missing_ok=True)
+                    dbg(f"capture: swept stale fifo {old_fifo.name}")
+                except PermissionError:
+                    pass                     # someone else's pid; not ours to judge
+
+            fifo = run_dir / f"nxas-cap-{os.getpid()}.raw"
 
             self.capture = Capture(
                 output=self.args.output,
@@ -1725,12 +1769,20 @@ class BatteryMirror:
         await self.adb.run("shell", "dumpsys", "battery", "set", key, value,
                            timeout=self.ADB_TIMEOUT)
 
-    async def reset(self) -> None:
+    async def reset(self, force: bool = False) -> None:
         """Hand the battery service back to the HAL.  Idempotent, and safe to
-        call from a shutdown path where adb may already be unreachable."""
+        call from a shutdown path where adb may already be unreachable.
+
+        `force` sends the command even when THIS process never applied an
+        override — which is the only way to clear one left behind by a daemon
+        that was SIGKILLed, or by a detach whose reset could not reach adb. A
+        fresh process has _forced=False, so without it the "clean up whatever
+        the last session left" call on attach did precisely nothing and the
+        container stayed pinned at a dead session's level.
+        """
         async with self._lock:
             self._epoch += 1
-            if not self._forced:
+            if not self._forced and not force:
                 return
             self._forced = False
             self._applied = None
@@ -2057,12 +2109,31 @@ class ScrcpyInjector(Injector):
         # during development leave a pile of them pointing at dead scrcpy
         # sockets. Harmless individually, but they accumulate forever.
         try:
+            # Abstract sockets still bound inside the container belong to a
+            # scrcpy server that is alive; anything else is debris.
+            live_sockets = set()
+            try:
+                net = await self._run("shell", "cat", "/proc/net/unix", check=False)
+                for ln in (net or "").splitlines():
+                    for tok in ln.split():
+                        if tok.startswith("@scrcpy_"):
+                            live_sockets.add(tok[1:])
+            except Exception:
+                pass            # cannot tell -> reap nothing, never break a peer
             listing = await self._run("forward", "--list", check=False)
             for line in (listing or "").splitlines():
                 parts = line.split()
-                if len(parts) >= 3 and parts[2].startswith("localabstract:scrcpy_"):
-                    await self._run("forward", "--remove", parts[1], check=False)
-                    dbg(f"input: removed stale forward {parts[1]} -> {parts[2]}")
+                if len(parts) < 3 or not parts[2].startswith("localabstract:scrcpy_"):
+                    continue
+                # Only reap forwards whose scrcpy server is actually gone.
+                # "any scrcpy_* forward is stale" reaped a LIVE sibling
+                # daemon's touch forward — a second display, or a test
+                # instance, would silently break the real session's input.
+                sock = parts[2].split(":", 1)[1]
+                if sock in live_sockets:
+                    continue
+                await self._run("forward", "--remove", parts[1], check=False)
+                dbg(f"input: removed stale forward {parts[1]} -> {parts[2]}")
         except Exception as exc:
             dbg(f"input: could not tidy stale forwards ({exc!r})")
 
@@ -2635,7 +2706,10 @@ class Daemon:
             # The battery override belongs to whoever is holding the phone. A
             # no-op unless a previous session left one behind (takeover, or a
             # detach whose reset could not reach adb).
-            await self._reset_battery()
+            # force=True: clears an override left by a SIGKILLed daemon or a
+            # detach whose reset never reached adb. Without it this call was a
+            # no-op on a fresh process, which is exactly the case it exists for.
+            await self._reset_battery(force=True)
             log(f"ws: client {peer} connected — building pipeline")
             try:
                 await self.loop.run_in_executor(
@@ -2682,12 +2756,12 @@ class Daemon:
         await self._reset_battery()
 
     # -- battery mirror -----------------------------------------------------
-    async def _reset_battery(self) -> None:
+    async def _reset_battery(self, force: bool = False) -> None:
         """Hand the container's battery back to its own HAL. Never raises."""
         if self.battery is None:
             return
         try:
-            await self.battery.reset()
+            await self.battery.reset(force=force)
         except Exception as exc:            # pragma: no cover - defensive
             warn(f"battery: reset failed ({exc!r})")
 
@@ -2784,6 +2858,11 @@ class Daemon:
             return None                       # explicit null = leave alone
         # bool is an int in Python; "bitrate": true is junk, not 1.
         if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            self._config_junk(key, raw)
+            return None
+        # json.loads accepts NaN/Infinity, and int(nan) raises — which would
+        # propagate out of the message handler and tear the session down.
+        if not math.isfinite(raw):
             self._config_junk(key, raw)
             return None
         value = int(raw)
@@ -2994,7 +3073,18 @@ class Daemon:
                     except ValueError:
                         warn(f"ws: non-JSON message from {peer}")
                         continue
-                    await self.on_message(ws, payload)
+                    if not isinstance(payload, dict):
+                        warn(f"ws: ignoring non-object message from {peer}")
+                        continue
+                    try:
+                        await self.on_message(ws, payload)
+                    except Exception as exc:
+                        # One malformed field must never cost the session. An
+                        # exception here used to fall through to detach and tear
+                        # the whole pipeline down — a client sending
+                        # sdpMLineIndex:"abc" could hang up everyone's stream.
+                        warn(f"ws: message from {peer} failed "
+                             f"({type(exc).__name__}: {exc}) — session kept")
                 elif raw.type == WSMsgType.ERROR:
                     err(f"ws: connection error: {ws.exception()}")
         finally:

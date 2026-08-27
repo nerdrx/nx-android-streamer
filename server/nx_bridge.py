@@ -35,6 +35,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -353,11 +354,22 @@ class PickerBridge:
             self._seen.add(path)
             await self._take_request(path)
 
+    # /sdcard/... spool paths only: letters, digits, dot, dash, underscore, slash.
+    _SAFE_SPOOL_PATH = re.compile(r"[A-Za-z0-9._/-]{1,256}")
+
     async def _take_request(self, path: str) -> None:
         """Read the request and delete it in one shell round trip: the file is a
         one-shot doorbell, and leaving it there would re-fire it forever if
         anything below throws."""
-        rc, out = await self.adb.shell(f"cat {path}; rm -f {path}", timeout=15.0)
+        # Quote the path: it comes from `ls` inside the container, so an app
+        # able to write the spool could name a file `x;cmd;.json` and have that
+        # run as the container's shell user. Container-scoped, but free to shut.
+        if not self._SAFE_SPOOL_PATH.fullmatch(path):
+            warn(f"bridge: refusing request with a suspicious name: {path!r}")
+            self._seen.discard(path)
+            return
+        quoted = shlex.quote(path)
+        rc, out = await self.adb.shell(f"cat {quoted}; rm -f {quoted}", timeout=15.0)
         self._seen.discard(path)             # it is gone now; forget the name
         if rc != 0:
             warn(f"bridge: could not read request {path} (rc={rc})")
