@@ -389,6 +389,21 @@ cmd_doctor() {
         log "screen timeout + lockscreen disabled ✓"
     fi
 
+    # Camera: a v4l2loopback node created after the container started is
+    # invisible inside it — the node list is baked into config_nodes when the
+    # CONTAINER starts, not the session. Detect the mismatch and say so.
+    if ls /dev/video* >/dev/null 2>&1 && adb devices 2>/dev/null | grep -q "5555[[:space:]]*device"; then
+        local dev host_nodes cont_nodes
+        dev=$(adb devices | awk '/5555[[:space:]]*device/{print $1; exit}')
+        host_nodes=$(ls /dev/video* 2>/dev/null | wc -l)
+        cont_nodes=$(adb -s "$dev" shell 'ls /dev/video*' 2>/dev/null | tr -d '\r' | grep -c video)
+        if (( host_nodes > cont_nodes )); then
+            log "camera: host has $host_nodes /dev/video* nodes, container sees $cont_nodes."
+            log "        a node added after container start is not passed through — fix with:"
+            log "        sudo systemctl restart waydroid-container"
+        fi
+    fi
+
     log "authorizing host adb key + enabling adbd on tcp/5555..."
     [[ -f $HOME/.android/adbkey.pub ]] || { log "  generating adb key..."; adb keygen "$HOME/.android/adbkey" >/dev/null 2>&1 || true; adb start-server >/dev/null 2>&1 || true; }
     [[ -f $HOME/.android/adbkey.pub ]] || die "no $HOME/.android/adbkey.pub — install android-tools and run 'adb start-server' once"
