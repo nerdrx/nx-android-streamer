@@ -335,7 +335,9 @@ class SettingsView(context: Context, private val host: Host) : ScrollView(contex
             if (prefs.adaptiveBitrate)
                 "Adapts to the link, never above this."
             else "Fixed rate — no adaptation."))
-        val rates = listOf(2000, 4000, 6000, 8000, 12000, 20000)
+        // Up to 60M: on LAN the link is not the limit, and a high-fps 1080x2400
+        // stream will happily use it. ABR still caps itself to what survives.
+        val rates = listOf(4000, 8000, 15000, 25000, 40000, 60000)
         val rateIdx = rates.indexOfFirst { it >= prefs.bitrateKbps }.let { if (it < 0) rates.lastIndex else it }
         col.addView(Segmented(ctx, rates.map { "${it / 1000}M" }, rateIdx) { i ->
             prefs.bitrateKbps = rates[i]

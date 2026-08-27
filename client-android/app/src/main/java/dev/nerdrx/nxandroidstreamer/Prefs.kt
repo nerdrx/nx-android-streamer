@@ -118,8 +118,8 @@ class Prefs(context: Context) {
 
     /** Ceiling in kbps when ABR is on; the fixed rate when it is off. */
     var bitrateKbps: Int
-        get() = sp.getInt(KEY_BITRATE, 8000)
-        set(v) = sp.edit().putInt(KEY_BITRATE, v.coerceIn(500, 50000)).apply()
+        get() = sp.getInt(KEY_BITRATE, 15000)
+        set(v) = sp.edit().putInt(KEY_BITRATE, v.coerceIn(500, 150000)).apply()
 
     var fps: Int
         get() = sp.getInt(KEY_FPS, 60)
