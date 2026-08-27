@@ -24,6 +24,13 @@ rm -rf "${DIST:?}/$NAME"
 APK="$ROOT/client-android/app/build/outputs/apk/release/app-release.apk"
 if [[ -f $APK ]]; then
     cp "$APK" "$DIST/nx-android-streamer-${V}.apk"
+    # Guard the version drift that let the About screen claim 0.2.0 for four
+    # releases: the APK must actually be built from this version.
+    GRADLE_V=$(grep -oP 'versionName "\K[^"]+' "$ROOT/client-android/app/build.gradle" 2>/dev/null || echo "?")
+    if [[ $GRADLE_V != "$V" ]]; then
+        echo "WARNING: client-android versionName is $GRADLE_V but this release is $V." >&2
+        echo "  Bump versionName/versionCode and rebuild, or the app will misreport itself." >&2
+    fi
 else
     echo "WARNING: no APK at $APK — releasing WITHOUT the phone client." >&2
     echo "  build it first: cd client-android && ./gradlew assembleRelease" >&2
