@@ -191,6 +191,22 @@ cmd_doctor() {
     sudo waydroid shell -- /system/bin/sh -c \
         'logcat -d -t 400 2>/dev/null | grep -iE "EthernetTracker|EthernetNetworkFactory|dhcp|eth0" | tail -15' || true
 
+    # The most common cause of "android broadcasts DHCPDISCOVER but dnsmasq
+    # never sees one": a host firewall. ufw's default-deny input drops udp/67
+    # from the bridge (its counters prove it). Allow the waydroid bridge and
+    # DHCP + internet come back permanently.
+    if need ufw && sudo ufw status 2>/dev/null | grep -q "Status: active"; then
+        if ! sudo ufw status 2>/dev/null | grep -q "on waydroid0"; then
+            log "ufw is active with no waydroid0 rules — it is eating android's DHCP. Fixing:"
+            sudo ufw allow in on waydroid0
+            sudo ufw route allow in on waydroid0
+            sudo ufw route allow out on waydroid0
+            log "  bouncing eth0 to retry DHCP..."
+            sudo waydroid shell -- /system/bin/sh -c 'ip link set eth0 down' || true; sleep 2
+            sudo waydroid shell -- /system/bin/sh -c 'ip link set eth0 up' || true; sleep 8
+        fi
+    fi
+
     if ! sudo waydroid shell -- /system/bin/sh -c 'ip addr show eth0 2>/dev/null' | grep -q 'inet '; then
         log "eth0 has no IPv4 — applying static config $wip/24 via $gw"
         sudo waydroid shell -- /system/bin/sh -c "

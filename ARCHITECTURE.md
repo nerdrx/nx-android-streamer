@@ -90,6 +90,24 @@ observe RTT/loss from RTCP, feed encoder bitrate/keyframe decisions.
   - reconnect state machine that survives doze, network handoff (Wi-Fi↔5G),
     and lock/unlock — the Pico-standby lesson from WiVRn
 
+## Reverse streams — camera and mic (planned, v0.2/v0.3)
+
+The forward direction makes the PC's Android visible on the phone; feature-
+complete means the phone's *hardware* is visible to the PC's Android too.
+
+- **Mic**: upstream WebRTC audio track from the client → daemon → a virtual
+  PipeWire source set as the default input for the Waydroid session. Android's
+  audio HAL records from the host default source, so apps just see "the mic".
+- **Camera**: upstream WebRTC video track → daemon decodes into a
+  **v4l2loopback** device → device passed into the LXC container → Android's
+  external-camera HAL (the USB-webcam path, Android 9+) exposes it as a real
+  camera. Good enough for video calls; not for 4K60 vlogging.
+- **Prerequisite**: browsers only grant `getUserMedia` on secure origins, so
+  the PWA path needs https (Tailscale can issue real certs for its hostnames) —
+  the native Kotlin client has no such restriction and is the intended carrier
+  for both. Idle cost is zero: reverse tracks are negotiated only while an
+  Android app actually holds the camera/mic open.
+
 ## Native-feel checklist
 
 The bar: someone picks up the Pixel and doesn't notice it's remote.
@@ -103,6 +121,8 @@ The bar: someone picks up the Pixel and doesn't notice it's remote.
 - [ ] hardware volume keys control remote Android
 - [ ] clipboard sync both directions
 - [ ] Waydroid notifications bridged to real phone notifications
+- [ ] phone camera available to remote Android apps (v4l2loopback bridge)
+- [ ] phone mic available to remote Android apps (virtual PipeWire source)
 - [ ] battery drain comparable to video playback
 
 ## Latency budget (target, 5G)
