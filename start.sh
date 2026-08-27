@@ -399,8 +399,10 @@ cmd_doctor() {
         cont_nodes=$(adb -s "$dev" shell 'ls /dev/video*' 2>/dev/null | tr -d '\r' | grep -c video)
         if (( host_nodes > cont_nodes )); then
             log "camera: host has $host_nodes /dev/video* nodes, container sees $cont_nodes."
-            log "        a node added after container start is not passed through — fix with:"
-            log "        sudo systemctl restart waydroid-container"
+            log "        waydroid writes its device-node list ONLY in 'waydroid init' and"
+            log "        'waydroid upgrade' — restarting the container or the session does"
+            log "        NOT regenerate it. Pick up a new /dev/video* node with:"
+            log "        sudo waydroid upgrade -o     # -o = just refresh configs"
         fi
     fi
 
