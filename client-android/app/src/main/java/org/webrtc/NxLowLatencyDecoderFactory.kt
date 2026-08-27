@@ -88,17 +88,34 @@ class NxLowLatencyDecoderFactory(
     private val software = SoftwareVideoDecoderFactory()
 
     override fun createDecoder(codec: VideoCodecInfo): VideoDecoder? {
-        val mime = VideoCodecMimeType.valueOf(codec.name.uppercase())
+        val mime = try {
+            VideoCodecMimeType.valueOf(codec.name.uppercase())
+        } catch (e: IllegalArgumentException) {
+            return software.createDecoder(codec)
+        }
         val info = findHardwareCodec(mime)
         if (info != null) {
-            Log.d(TAG, "low-latency hardware decoder: ${info.name} for ${codec.name}")
-            return AndroidVideoDecoder(
-                LowLatencyCodecFactory(), info.name, mime,
-                MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible, eglContext
+            // The colour format MUST come from the codec's own capabilities.
+            // Hardcoding one (COLOR_FormatYUV420Flexible) made libwebrtc's
+            // native decode path abort the whole process the moment the first
+            // frame arrived — it crashed right after "live". Let libwebrtc pick
+            // from the same list it uses internally, and fall back to software
+            // if this codec offers nothing usable.
+            val caps = info.getCapabilitiesForType(mime.mimeType())
+            val colorFormat = MediaCodecUtils.selectColorFormat(
+                MediaCodecUtils.DECODER_COLOR_FORMATS, caps
             )
+            if (colorFormat != null) {
+                Log.d(TAG, "low-latency hardware decoder: ${info.name} " +
+                    "for ${codec.name} (colorFormat=$colorFormat)")
+                return AndroidVideoDecoder(
+                    LowLatencyCodecFactory(), info.name, mime, colorFormat, eglContext
+                )
+            }
+            Log.w(TAG, "${info.name} exposes no supported colour format; using default path")
         }
-        Log.d(TAG, "no hardware decoder for ${codec.name}; falling back to software")
-        return software.createDecoder(codec)
+        Log.d(TAG, "no low-latency path for ${codec.name}; falling back")
+        return hardware.createDecoder(codec) ?: software.createDecoder(codec)
     }
 
     override fun getSupportedCodecs(): Array<VideoCodecInfo> {
