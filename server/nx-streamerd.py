@@ -383,6 +383,7 @@ class Streamer:
         )
 
     def start(self, send_json) -> None:
+        self._tearing_down = False        # a fault from here on is a real fault
         """Runs in an executor thread (parse_launch + state changes block)."""
         try:
             self._start(send_json)
@@ -581,6 +582,9 @@ class Streamer:
     # -- bus ----------------------------------------------------------------
     def _on_bus_error(self, _bus, message) -> None:
         gerror, debug = message.parse_error()
+        if getattr(self, "_tearing_down", False):
+            log(f"gst: {message.src.get_name()}: {gerror.message} (during teardown)")
+            return
         err(f"gst: {message.src.get_name()}: {gerror.message}")
         if debug:
             err(f"gst: debug: {debug.strip()}")
@@ -593,6 +597,13 @@ class Streamer:
             warn(f"gst: debug: {debug.strip()}")
 
     def _on_bus_eos(self, _bus, _message) -> None:
+        # A client leaving stops wf-recorder, which EOSes the fifo. That is our
+        # own doing: tear the pipeline down and keep serving. Treating it as
+        # fatal killed the daemon on the FIRST disconnect, so every client after
+        # it found nothing listening and reconnected forever.
+        if getattr(self, "_tearing_down", False):
+            log("gst: end-of-stream (expected, client left)")
+            return
         err("gst: end-of-stream on the capture fifo — wf-recorder stopped writing")
         self.on_fatal(1)
 
@@ -610,6 +621,7 @@ class Streamer:
     # -- teardown -----------------------------------------------------------
     def stop(self) -> None:
         with self._lock:
+            self._tearing_down = True     # EOS/errors below are ours, not faults
             self._setup_done = False
             self._negotiation_wanted = False
             self._sendonly_done = False
