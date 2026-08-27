@@ -108,6 +108,7 @@ class StreamClient(
     private var pendingBattery: Pair<Int, Boolean>? = null
     private var connectStartedAt = 0L
 
+
     private val pingRunnable = object : Runnable {
         override fun run() {
             pingTick(gen)
@@ -563,19 +564,34 @@ class StreamClient(
     // Touch -> datachannel (called from the UI thread; DataChannel.send is safe)
     // ---------------------------------------------------------------------
 
-    fun sendTouchDown(id: Int, x: Float, y: Float) =
-        sendInput(JSONObject().put("t", "td").put("id", id).put("x", x.toDouble()).put("y", y.toDouble()))
+    fun sendTouchDown(id: Int, x: Float, y: Float, eventTimeMs: Long = 0L) =
+        sendInput(JSONObject().put("t", "td").put("id", id).put("x", x.toDouble()).put("y", y.toDouble()),
+                  eventTimeMs)
 
-    fun sendTouchMove(id: Int, x: Float, y: Float) =
-        sendInput(JSONObject().put("t", "tm").put("id", id).put("x", x.toDouble()).put("y", y.toDouble()))
+    fun sendTouchMove(id: Int, x: Float, y: Float, eventTimeMs: Long = 0L) =
+        sendInput(JSONObject().put("t", "tm").put("id", id).put("x", x.toDouble()).put("y", y.toDouble()),
+                  eventTimeMs)
 
     fun sendTouchUp(id: Int) =
         sendInput(JSONObject().put("t", "tu").put("id", id))
 
-    private fun sendInput(obj: JSONObject) {
+    /**
+     * Set NXAS_TRACE_INPUT to log how long each touch spends between the
+     * MotionEvent and the wire, and how much is queued in the datachannel.
+     * A growing bufferedAmount means SCTP is pacing us, which shows up as
+     * touch lag with perfectly healthy video.
+     */
+    private fun traceInput(eventTimeMs: Long, d: DataChannel) {
+        val age = android.os.SystemClock.uptimeMillis() - eventTimeMs
+        val queued = try { d.bufferedAmount() } catch (e: Exception) { -1L }
+        Log.d(TAG, "input trace: event->send ${age}ms, dc queued ${queued}B")
+    }
+
+    private fun sendInput(obj: JSONObject, eventTimeMs: Long = 0L) {
         val d = dc ?: return
         if (d.state() != DataChannel.State.OPEN) return
         try {
+            if (eventTimeMs > 0L) traceInput(eventTimeMs, d)
             val bytes = obj.toString().toByteArray(StandardCharsets.UTF_8)
             d.send(DataChannel.Buffer(ByteBuffer.wrap(bytes), false))  // false = text frame
         } catch (e: Exception) {

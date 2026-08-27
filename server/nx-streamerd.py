@@ -1429,9 +1429,17 @@ class Streamer:
             y = msg.get("y")
             # An injector must never take the stream down with it: a broken
             # touch path is a degraded session, not a dead one.
+            # Trace how long WE take between the datachannel handing us the
+            # event and the bytes being on their way to android. Anything big
+            # here is ours; anything small means the delay is upstream (SCTP
+            # pacing on the phone) or downstream (scrcpy/android).
+            t0 = time.perf_counter()
             self.injector.handle_touch(kind, ident,
                                        None if x is None else float(x),
                                        None if y is None else float(y))
+            if kind == "td":
+                dt = (time.perf_counter() - t0) * 1000.0
+                log(f"input trace: recv->inject {dt:.2f}ms ({kind})")
         except Exception as exc:
             warn(f"input: {kind} failed: {exc}")
 

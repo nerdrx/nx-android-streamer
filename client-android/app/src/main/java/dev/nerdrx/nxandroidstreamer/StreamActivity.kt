@@ -407,7 +407,7 @@ class StreamActivity : AppCompatActivity(), StreamClient.Listener, StreamView.Ca
 
     // ---- StreamView.Callbacks ------------------------------------------
 
-    override fun onTouchDown(id: Int, x: Float, y: Float) { client?.sendTouchDown(id, x, y) }
+    override fun onTouchDown(id: Int, x: Float, y: Float, eventTimeMs: Long) { client?.sendTouchDown(id, x, y, eventTimeMs) }
     override fun onTouchMove(id: Int, x: Float, y: Float) { client?.sendTouchMove(id, x, y) }
     override fun onTouchUp(id: Int) { client?.sendTouchUp(id) }
     override fun onResolution(width: Int, height: Int) {

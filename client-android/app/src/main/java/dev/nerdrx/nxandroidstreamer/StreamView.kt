@@ -29,7 +29,7 @@ import kotlin.math.min
 class StreamView(context: Context) : FrameLayout(context) {
 
     interface Callbacks {
-        fun onTouchDown(id: Int, x: Float, y: Float)
+        fun onTouchDown(id: Int, x: Float, y: Float, eventTimeMs: Long = 0L)
         fun onTouchMove(id: Int, x: Float, y: Float)
         fun onTouchUp(id: Int)
         fun onResolution(width: Int, height: Int)
@@ -174,14 +174,14 @@ class StreamView(context: Context) : FrameLayout(context) {
                 main.postDelayed(longPress, LONG_PRESS_MS)
                 val pid = event.getPointerId(idx)
                 val slot = acquireSlot(pid)
-                if (slot >= 0) cb.onTouchDown(slot, normX(event.getX(idx)), normY(event.getY(idx)))
+                if (slot >= 0) cb.onTouchDown(slot, normX(event.getX(idx)), normY(event.getY(idx)), event.eventTime)
             }
             MotionEvent.ACTION_POINTER_DOWN -> {
                 disarmLongPress()                 // multi-touch is not a long-press
                 val idx = event.actionIndex
                 val pid = event.getPointerId(idx)
                 val slot = acquireSlot(pid)
-                if (slot >= 0) cb.onTouchDown(slot, normX(event.getX(idx)), normY(event.getY(idx)))
+                if (slot >= 0) cb.onTouchDown(slot, normX(event.getX(idx)), normY(event.getY(idx)), event.eventTime)
             }
             MotionEvent.ACTION_MOVE -> {
                 // Cancel the long-press once the finger travels.
