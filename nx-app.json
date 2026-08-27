@@ -14,7 +14,7 @@
       "binHint": "start.sh",
       "args": ["serve"],
       "postInstallNote": "One-time setup needs root and downloads ~1 GB, so it runs in a terminal window: press Run and follow it (setup → ARM apps → network/adb repair). After that, Launch boots the Android session AND starts streaming — the card shows live status while it runs, and Stop shuts it down.",
-      "postInstallCmd": "sh -c 'cd \"$HOME\"/Applications/nx/nx-android-streamer/*/ && ./scripts/first-run.sh'"
+      "postInstallCmd": "sh -c 'cd \"$HOME/Applications/nx/nx-android-streamer/archive-dir-linux\" && exec ./scripts/first-run.sh'"
     },
     {
       "assetPattern": "nx-android-streamer-*.apk",

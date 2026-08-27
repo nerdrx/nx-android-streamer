@@ -13,7 +13,7 @@ nx manifest check --file "$ROOT/nx-app.json"
 rm -rf "$DIST"; mkdir -p "$DIST/$NAME"
 cp "$ROOT"/start.sh "$ROOT"/README.md "$ROOT"/ARCHITECTURE.md "$ROOT"/BORROWED.md \
    "$ROOT"/CONTRIBUTING.md "$ROOT"/LICENSE "$DIST/$NAME/"
-cp -r "$ROOT"/server "$ROOT"/web "$ROOT"/gui "$DIST/$NAME/"   # daemon + phone client + tray gui
+cp -r "$ROOT"/server "$ROOT"/web "$ROOT"/gui "$ROOT"/scripts "$DIST/$NAME/"  # daemon + client + tray + first-run
 find "$DIST/$NAME" -name '__pycache__' -type d -prune -exec rm -rf {} +
 tar -C "$DIST" -czf "$DIST/$NAME.tar.gz" "$NAME"
 rm -rf "${DIST:?}/$NAME"
