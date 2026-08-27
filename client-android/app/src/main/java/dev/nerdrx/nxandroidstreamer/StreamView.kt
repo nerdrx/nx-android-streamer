@@ -53,14 +53,11 @@ class StreamView(context: Context) : FrameLayout(context) {
     // long-press to open settings mid-stream
     private var downX = 0f
     private var downY = 0f
-    private var longPressArmed = false
-    private val longPress = Runnable {
-        if (longPressArmed) {
-            longPressArmed = false
-            liftEverything()
-            callbacks?.onOpenSettings()
-        }
-    }
+    // NOTE: there is deliberately no long-press-to-open-settings here. Long
+    // press is a first-class Android gesture — icons, text selection, context
+    // menus — and swallowing it means the remote device can never receive one.
+    // Settings live behind the edge handle instead, which costs the stream
+    // nothing.
 
     init {
         setBackgroundColor(0xFF0A0A12.toInt())
@@ -170,27 +167,17 @@ class StreamView(context: Context) : FrameLayout(context) {
             MotionEvent.ACTION_DOWN -> {
                 val idx = event.actionIndex
                 downX = event.getX(idx); downY = event.getY(idx)
-                longPressArmed = true
-                main.postDelayed(longPress, LONG_PRESS_MS)
                 val pid = event.getPointerId(idx)
                 val slot = acquireSlot(pid)
                 if (slot >= 0) cb.onTouchDown(slot, normX(event.getX(idx)), normY(event.getY(idx)), event.eventTime)
             }
-            MotionEvent.ACTION_POINTER_DOWN -> {
-                disarmLongPress()                 // multi-touch is not a long-press
+            MotionEvent.ACTION_POINTER_DOWN -> {                 // multi-touch is not a long-press
                 val idx = event.actionIndex
                 val pid = event.getPointerId(idx)
                 val slot = acquireSlot(pid)
                 if (slot >= 0) cb.onTouchDown(slot, normX(event.getX(idx)), normY(event.getY(idx)), event.eventTime)
             }
             MotionEvent.ACTION_MOVE -> {
-                // Cancel the long-press once the finger travels.
-                if (longPressArmed) {
-                    val idx0 = 0
-                    if (abs(event.getX(idx0) - downX) > TOUCH_SLOP || abs(event.getY(idx0) - downY) > TOUCH_SLOP) {
-                        disarmLongPress()
-                    }
-                }
                 // Historical samples carry every OS-captured point between frames, so a
                 // fast swipe arrives as a real curve (app.js getCoalescedEvents).
                 val history = event.historySize
@@ -210,7 +197,6 @@ class StreamView(context: Context) : FrameLayout(context) {
                 if (slot >= 0) cb.onTouchUp(slot)
             }
             MotionEvent.ACTION_UP -> {
-                disarmLongPress()
                 val idx = event.actionIndex
                 val pid = event.getPointerId(idx)
                 val slot = releaseSlot(pid)
@@ -219,16 +205,10 @@ class StreamView(context: Context) : FrameLayout(context) {
             MotionEvent.ACTION_CANCEL -> {
                 // The system stole the gesture (back swipe, call UI): lift on the
                 // remote side too, or a finger stays stuck down forever.
-                disarmLongPress()
                 liftEverything()
             }
         }
         return true
-    }
-
-    private fun disarmLongPress() {
-        longPressArmed = false
-        main.removeCallbacks(longPress)
     }
 
     /** Called by the activity when the app backgrounds: never leave fingers down. */
@@ -236,7 +216,6 @@ class StreamView(context: Context) : FrameLayout(context) {
 
     companion object {
         private const val MAX_TOUCH_IDS = 10
-        private const val LONG_PRESS_MS = 600L
         private const val TOUCH_SLOP = 24f
     }
 }
