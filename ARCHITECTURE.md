@@ -119,6 +119,16 @@ remote screenshots and downloads flow back. A network drive/SMB share can't do
 this — Android galleries only index local MediaStore storage, which is exactly
 what the sync target is.
 
+**On-demand picker bridge**: the sharper version. A small companion app inside
+the remote Android (`nx-bridge`, planned) registers as a photo/file picker
+(`ACTION_GET_CONTENT` / DocumentsProvider). When a remote app requests a
+picture, the *real* phone's picker opens (native in the Kotlin client; a plain
+file input in the PWA — no secure-context needed), the chosen file rides the
+existing connection into `/sdcard`, gets media-scanned, and completes the
+intent as if picked locally. The same companion app is the intended home for
+the notification bridge and clipboard sync — one in-container helper, many
+native-feel features.
+
 ## Native-feel checklist
 
 The bar: someone picks up the Pixel and doesn't notice it's remote.
