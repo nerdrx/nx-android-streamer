@@ -377,7 +377,11 @@ class Streamer:
             # black screen. Force the profile every client can actually decode.
             f"! video/x-h264,profile=constrained-baseline "
             f"! h264parse config-interval=-1 "
-            f"! rtph264pay name=pay pt=96 "
+            # Tailscale/WireGuard tunnels are 1280-byte MTU. rtph264pay defaults to
+            # ~1400, so every RTP packet is oversized and silently dropped inside
+            # the tunnel: signaling and ICE succeed, then not one video frame ever
+            # arrives. 1100 leaves room for RTP+UDP+IP+WireGuard overhead.
+            f"! rtph264pay name=pay pt=96 mtu=1100 "
             f"! application/x-rtp,media=video,encoding-name=H264,payload=96 "
             f"! webrtcbin name=webrtc bundle-policy=max-compat"
         )
