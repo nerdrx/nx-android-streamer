@@ -11,7 +11,10 @@ NAME="nx-android-streamer-${V}-linux-x86_64"
 nx manifest check --file "$ROOT/nx-app.json"
 
 rm -rf "$DIST"; mkdir -p "$DIST/$NAME"
-cp "$ROOT"/start.sh "$ROOT"/README.md "$ROOT"/ARCHITECTURE.md "$ROOT"/BORROWED.md "$ROOT"/LICENSE "$DIST/$NAME/"
+cp "$ROOT"/start.sh "$ROOT"/README.md "$ROOT"/ARCHITECTURE.md "$ROOT"/BORROWED.md \
+   "$ROOT"/CONTRIBUTING.md "$ROOT"/LICENSE "$DIST/$NAME/"
+cp -r "$ROOT"/server "$ROOT"/web "$DIST/$NAME/"        # the daemon + phone client
+find "$DIST/$NAME" -name '__pycache__' -type d -prune -exec rm -rf {} +
 tar -C "$DIST" -czf "$DIST/$NAME.tar.gz" "$NAME"
 rm -rf "${DIST:?}/$NAME"
 
