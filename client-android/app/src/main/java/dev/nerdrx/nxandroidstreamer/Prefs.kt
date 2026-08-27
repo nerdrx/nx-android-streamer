@@ -86,8 +86,28 @@ class Prefs(context: Context) {
         get() = sp.getBoolean(KEY_KEEP_AWAKE, true)
         set(v) = sp.edit().putBoolean(KEY_KEEP_AWAKE, v).apply()
 
+    // ---- stream quality (sent to the server as a config message) --------
+    // The server is authoritative and clamps these; we only remember what the
+    // user asked for so a reconnect re-applies it.
+
+    var adaptiveBitrate: Boolean
+        get() = sp.getBoolean(KEY_ABR, true)
+        set(v) = sp.edit().putBoolean(KEY_ABR, v).apply()
+
+    /** Ceiling in kbps when ABR is on; the fixed rate when it is off. */
+    var bitrateKbps: Int
+        get() = sp.getInt(KEY_BITRATE, 8000)
+        set(v) = sp.edit().putInt(KEY_BITRATE, v.coerceIn(500, 50000)).apply()
+
+    var fps: Int
+        get() = sp.getInt(KEY_FPS, 60)
+        set(v) = sp.edit().putInt(KEY_FPS, v.coerceIn(15, 120)).apply()
+
     companion object {
         const val DEFAULT_PORT = 8765
+        private const val KEY_ABR = "abr"
+        private const val KEY_BITRATE = "bitrate_kbps"
+        private const val KEY_FPS = "fps"
         private const val KEY_SERVERS = "servers"
         private const val KEY_LAST_USED = "last_used"
         private const val KEY_AUTOCONNECT = "autoconnect"

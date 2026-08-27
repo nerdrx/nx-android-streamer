@@ -37,6 +37,8 @@ class SettingsView(context: Context, private val host: Host) : ScrollView(contex
         fun currentRttMs(): Int?
         fun currentResolution(): String?
         fun onSettingsChanged()
+        /** Push bitrate/fps/abr to the server for the live session. */
+        fun onQualityChanged()
     }
 
     private val col = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
@@ -132,6 +134,7 @@ class SettingsView(context: Context, private val host: Host) : ScrollView(contex
 
         // Settings sections
         renderDisplaySection()
+        renderQualitySection()
         renderBehaviorSection()
         renderAboutSection()
     }
@@ -303,6 +306,42 @@ class SettingsView(context: Context, private val host: Host) : ScrollView(contex
         col.addView(toggleRow(ctx, "Keep screen awake while streaming", prefs.keepAwake) {
             prefs.keepAwake = it; host.onSettingsChanged()
         })
+    }
+
+    /**
+     * Stream quality. These are the knobs that actually cost bandwidth, so they
+     * live on the phone: the server is told over the signaling socket and applies
+     * them live. The server clamps everything and echoes back what it really did.
+     */
+    private fun renderQualitySection() {
+        val ctx = context
+        val prefs = host.prefs
+        col.addView(Ui.sectionHeader(ctx, "Stream quality"))
+
+        col.addView(toggleRow(ctx, "Adaptive bitrate", prefs.adaptiveBitrate) {
+            prefs.adaptiveBitrate = it
+            host.onQualityChanged()
+            render()                                  // relabel the bitrate row
+        })
+        col.addView(settingRow(ctx, if (prefs.adaptiveBitrate) "Bitrate ceiling" else "Bitrate",
+            if (prefs.adaptiveBitrate)
+                "Adapts to the link, never above this."
+            else "Fixed rate — no adaptation."))
+        val rates = listOf(2000, 4000, 6000, 8000, 12000, 20000)
+        val rateIdx = rates.indexOfFirst { it >= prefs.bitrateKbps }.let { if (it < 0) rates.lastIndex else it }
+        col.addView(Segmented(ctx, rates.map { "${it / 1000}M" }, rateIdx) { i ->
+            prefs.bitrateKbps = rates[i]
+            host.onQualityChanged()
+        }, wide(Ui.dp(ctx, 8)))
+
+        col.addSpacer(Ui.dp(ctx, 14))
+        col.addView(settingRow(ctx, "Frame rate", "Lower costs less bandwidth; the session runs at 90Hz."))
+        val fpsOpts = listOf(30, 45, 60, 90)
+        val fpsIdx = fpsOpts.indexOfFirst { it >= prefs.fps }.let { if (it < 0) fpsOpts.lastIndex else it }
+        col.addView(Segmented(ctx, fpsOpts.map { "$it" }, fpsIdx) { i ->
+            prefs.fps = fpsOpts[i]
+            host.onQualityChanged()
+        }, wide(Ui.dp(ctx, 8)))
     }
 
     private fun renderBehaviorSection() {

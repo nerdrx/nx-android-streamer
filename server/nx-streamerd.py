@@ -44,6 +44,15 @@ gi.require_version("GstWebRTC", "1.0")
 gi.require_version("GstSdp", "1.0")
 from gi.repository import GLib, Gst, GstSdp, GstWebRTC  # noqa: E402
 
+# Only used to build the upstream force-key-unit event the adaptive-bitrate
+# controller sends after a cut.  Optional: without it we simply skip the
+# keyframe nudge rather than refusing to start.
+try:
+    gi.require_version("GstVideo", "1.0")
+    from gi.repository import GstVideo  # noqa: E402
+except (ValueError, ImportError):       # pragma: no cover - packaging variance
+    GstVideo = None
+
 import aiohttp  # noqa: E402
 from aiohttp import WSMsgType, web  # noqa: E402
 
@@ -327,6 +336,398 @@ def configure_encoder(enc: Gst.Element, name: str, bitrate_kbps: int, fps: int) 
     log(f"encoder: {name} @ {bitrate_kbps} kbps, key-int-max={gop} ({fps} fps)")
 
 
+# ------------------------------------------------------ adaptive bitrate ----
+
+class AdaptiveBitrate:
+    """Feeds RTCP-derived loss/RTT back into the encoder's bitrate.
+
+    This is the shape of the auto-bitrate loop in our WiVRn fork (ARCHITECTURE.md
+    "Transport"), ported to webrtcbin's stats: sample once a second, look at what
+    changed *in that second*, and move the encoder in one of three ways.
+
+        loss > 5%, or RTT spiking      ->  multiplicative decrease (x0.70)
+        loss < 1% and RTT calm, 5x     ->  additive increase (+10% of ceiling)
+        anything in between            ->  hold
+
+    Multiplicative-decrease/additive-increase (the TCP shape) is deliberate: the
+    expensive mistake is being too high — that is what drops the user's 5G
+    session — so we back off fast and crawl back up slowly.
+
+    Why we do this at all when webrtcbin already has GCC: GStreamer's congestion
+    control estimates the bandwidth but nothing in this pipeline *listens* to the
+    estimate, because our encoder bitrate is a plain property on a `vah264enc`
+    that GCC has never heard of.  This class is the missing wire.
+
+    Slow start: a session opens at 60% of the ceiling, not at the ceiling.  The
+    failure this whole class exists to fix is the *first* seconds of a mobile
+    session — a full-rate H.264 stream punched into a 5G uplink before anybody
+    has measured anything.  Probing upward costs ~20 s to reach the ceiling on a
+    link that can take it; probing downward costs a dropped connection.
+
+    Threading: `tick()` runs on the GLib main-loop thread (a GLib timeout), and
+    the get-stats reply lands on whatever thread webrtcbin completes the promise
+    on.  Every element call we make from either (property set, pad send_event) is
+    thread-safe in GStreamer.  The one hop out to asyncio is `on_sample`, which
+    the caller must make thread-safe.
+    """
+
+    INTERVAL_MS = 1000          # sampling period
+    SETTLE_S = 3.0              # ignore everything this soon after (re)negotiation
+    MIN_APPLY_INTERVAL = 1.0    # hysteresis: at most one change per second
+
+    LOSS_DOWN_PCT = 5.0         # above this, cut
+    LOSS_UP_PCT = 1.0           # below this (and calm RTT), a sample is "healthy"
+    RTT_SPIKE_FACTOR = 2.0      # "sharply rising" = 2x the session floor...
+    RTT_SPIKE_FLOOR_S = 0.150   # ...and only once it is genuinely large
+    RTT_EWMA_ALPHA = 0.3        # smoothing for the RTT we act on
+
+    DECREASE_FACTOR = 0.70
+    INCREASE_FRACTION = 0.10    # of the ceiling, per step
+    HEALTHY_STREAK = 5          # consecutive healthy samples before a step up
+    START_FRACTION = 0.60       # of the ceiling, at session start
+
+    def __init__(self, *, webrtc, encoder, encoder_name, max_kbps, min_kbps,
+                 on_sample=None, start_kbps=None):
+        self.webrtc = webrtc
+        self.encoder = encoder
+        self.encoder_name = encoder_name
+        self.max_kbps = int(max_kbps)
+        self.min_kbps = min(int(min_kbps), self.max_kbps)
+        self.on_sample = on_sample
+
+        # start_kbps is how a *resumed* controller keeps continuity: switching
+        # ABR back on mid-session must not drop the picture to 60% again.
+        start = start_kbps if start_kbps else int(self.max_kbps * self.START_FRACTION)
+        self.current_kbps = self._clamp(start)
+
+        self._can_set_bitrate = "bitrate" in {p.name for p in encoder.list_properties()}
+        self._started_at = time.monotonic()
+        self._last_apply = 0.0
+        self._healthy = 0
+        self._rtt_ewma = None       # seconds
+        self._rtt_min = None        # seconds, session floor
+        self._prev = None           # (packets_sent, packets_lost, bytes_sent)
+        self._in_flight = False     # a get-stats promise is outstanding
+        self._stopped = False
+        self._failed = False
+        self._source_id = None
+
+    # -- lifecycle ----------------------------------------------------------
+    def start(self) -> None:
+        """Apply the slow-start bitrate and arm the sampler."""
+        if not self._can_set_bitrate:
+            warn(f"abr: {self.encoder_name} has no 'bitrate' property — "
+                 "adaptive bitrate disabled for this session")
+            self._failed = True
+            return
+        self._set_encoder_bitrate(self.current_kbps)
+        log(f"abr: on — start {self.current_kbps} kbps, "
+            f"range {self.min_kbps}-{self.max_kbps} kbps, "
+            f"sampling every {self.INTERVAL_MS} ms")
+        self._source_id = GLib.timeout_add(self.INTERVAL_MS, self.tick)
+        self._notify()
+
+    def renegotiated(self) -> None:
+        """Media (re)starts now: drop the baseline and re-arm the settle window
+        so a fresh SSRC's counters are never read as a delta."""
+        self._prev = None
+        self._healthy = 0
+        self._started_at = time.monotonic()
+
+    def stop(self) -> None:
+        """Called from Streamer.stop(), i.e. an executor thread.
+
+        We only raise the flag; the timeout removes itself on its next wake-up.
+        Calling GLib.source_remove() across threads races with a dispatch that
+        already returned False and earns a GLib critical, and one wasted no-op
+        callback is cheaper than that.
+        """
+        self._stopped = True
+
+    # -- sampling -----------------------------------------------------------
+    def tick(self) -> bool:
+        if self._stopped or self._failed:
+            self._source_id = None
+            return False                     # unregister the timeout
+        try:
+            self._request_stats()
+        except Exception as exc:             # pragma: no cover - defensive
+            self._disable(f"sampling failed: {exc!r}")
+            return False
+        return True
+
+    def _request_stats(self) -> None:
+        if self._in_flight:
+            # The previous reply never came back (renegotiation, a stalled
+            # transport). Skip rather than queue promises forever.
+            return
+        webrtc = self.webrtc
+        if webrtc is None:
+            return
+        self._in_flight = True
+        promise = Gst.Promise.new_with_change_func(self._on_stats, None, None)
+        # None = "every stat", not just one pad's. webrtcbin fills the promise
+        # asynchronously; never promise.wait() here, that would deadlock the
+        # thread webrtcbin wants to reply on.
+        webrtc.emit("get-stats", None, promise)
+
+    def _on_stats(self, promise, _u1, _u2) -> None:
+        """Runs on a webrtcbin thread. Must never raise into GStreamer."""
+        self._in_flight = False
+        if self._stopped or self._failed:
+            return
+        try:
+            reply = promise.get_reply()
+            if reply is None:
+                return
+            sample = self._extract(reply)
+            if sample is not None:
+                self._evaluate(*sample)
+        except Exception as exc:
+            self._disable(f"stats handling failed: {exc!r}")
+
+    # -- parsing ------------------------------------------------------------
+    @staticmethod
+    def _stat_type(entry) -> int:
+        """The `type` field is a GstWebRTCStatsType enum; older bindings hand it
+        back as a plain int and some hand back the nick. Take any of them, and
+        fall back to the structure name (e.g. 'rtp-outbound-stream-stats')."""
+        try:
+            raw = entry.get_value("type")
+        except Exception:
+            raw = None
+        if raw is not None:
+            try:
+                return int(raw)
+            except (TypeError, ValueError):
+                nick = str(getattr(raw, "value_nick", raw))
+                for name, value in (("remote-inbound-rtp",
+                                     GstWebRTC.WebRTCStatsType.REMOTE_INBOUND_RTP),
+                                    ("outbound-rtp",
+                                     GstWebRTC.WebRTCStatsType.OUTBOUND_RTP)):
+                    if nick == name:
+                        return int(value)
+        name = entry.get_name() or ""
+        if "remote-inbound" in name:
+            return int(GstWebRTC.WebRTCStatsType.REMOTE_INBOUND_RTP)
+        if "outbound" in name:
+            return int(GstWebRTC.WebRTCStatsType.OUTBOUND_RTP)
+        return -1
+
+    @staticmethod
+    def _num(entry, field):
+        """Every field access is optional: entries appear and disappear across
+        negotiation, and a missing key must read as 'no data', never a crash."""
+        try:
+            if not entry.has_field(field):
+                return None
+            value = entry.get_value(field)
+        except Exception:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _extract(self, reply):
+        """-> (packets_sent, packets_lost, bytes_sent, rtt_seconds|None), or None
+        when the reply does not yet carry an outbound stream."""
+        out_sent = out_lost = out_bytes = None
+        rtt = None
+        lost_remote = None
+        try:
+            n = reply.n_fields()
+        except Exception:
+            return None
+        for i in range(n):
+            try:
+                key = reply.nth_field_name(i)
+                entry = reply.get_value(key)
+            except Exception:
+                continue
+            if not isinstance(entry, Gst.Structure):
+                continue
+            kind = self._stat_type(entry)
+            if kind == int(GstWebRTC.WebRTCStatsType.OUTBOUND_RTP):
+                sent = self._num(entry, "packets-sent")
+                if sent is None:
+                    continue
+                out_sent = sent if out_sent is None else out_sent + sent
+                sent_bytes = self._num(entry, "bytes-sent")
+                if sent_bytes is not None:
+                    out_bytes = sent_bytes if out_bytes is None \
+                        else out_bytes + sent_bytes
+            elif kind == int(GstWebRTC.WebRTCStatsType.REMOTE_INBOUND_RTP):
+                # The receiver's view, arriving in RTCP RR: this is the only
+                # place loss and RTT exist at all.
+                lost = self._num(entry, "packets-lost")
+                if lost is not None:
+                    lost_remote = lost if lost_remote is None else lost_remote + lost
+                value = self._num(entry, "round-trip-time")   # seconds
+                if value is not None and value > 0 and rtt is None:
+                    rtt = value
+        if out_sent is None:
+            return None                      # nothing sent yet
+        out_lost = lost_remote if lost_remote is not None else 0.0
+        return (out_sent, out_lost, out_bytes or 0.0, rtt)
+
+    # -- control law --------------------------------------------------------
+    def _evaluate(self, packets_sent, packets_lost, bytes_sent, rtt) -> None:
+        prev, self._prev = self._prev, (packets_sent, packets_lost, bytes_sent)
+        if prev is None:
+            return                           # first sample is only a baseline
+
+        d_sent = packets_sent - prev[0]
+        d_lost = packets_lost - prev[1]
+        if d_sent < 0 or d_lost < -1000:
+            # Counters went backwards: the SSRC was replaced (renegotiation).
+            # Re-baseline instead of acting on a nonsense delta.
+            dbg("abr: stats counters reset, re-baselining")
+            self._started_at = time.monotonic()
+            return
+        # RTCP's cumulative-lost is signed and *can* tick down when duplicates
+        # arrive. Negative loss over an interval is not a windfall; it is zero.
+        d_lost = max(0.0, d_lost)
+
+        if rtt is not None:
+            self._rtt_ewma = rtt if self._rtt_ewma is None else (
+                self.RTT_EWMA_ALPHA * rtt + (1 - self.RTT_EWMA_ALPHA) * self._rtt_ewma)
+            self._rtt_min = rtt if self._rtt_min is None else min(self._rtt_min, rtt)
+
+        expected = d_sent + d_lost
+        loss_pct = (100.0 * d_lost / expected) if expected > 0 else 0.0
+        rtt_ms = None if self._rtt_ewma is None else self._rtt_ewma * 1000.0
+
+        self._notify(rtt_ms)
+        dbg(f"abr: sample d_sent={int(d_sent)} d_lost={int(d_lost)} "
+            f"loss={loss_pct:.1f}% rtt={'?' if rtt_ms is None else f'{rtt_ms:.0f}ms'} "
+            f"at {self.current_kbps} kbps")
+
+        now = time.monotonic()
+        if now - self._started_at < self.SETTLE_S:
+            return                           # ICE/DTLS/first keyframe noise
+        if now - self._last_apply < self.MIN_APPLY_INTERVAL:
+            return                           # hysteresis
+
+        # "Rising sharply" is relative to what this path has actually shown us:
+        # 60 ms on a 5G link is fine, 60 ms on a link whose floor is 8 ms is a
+        # queue filling up. The absolute floor keeps a 3 ms LAN from tripping on
+        # a 7 ms blip.
+        rtt_spiking = (
+            self._rtt_ewma is not None
+            and self._rtt_min is not None
+            and self._rtt_ewma > self.RTT_SPIKE_FLOOR_S
+            and self._rtt_ewma > self.RTT_SPIKE_FACTOR * self._rtt_min
+        )
+
+        why = f"loss {loss_pct:.1f}%, rtt {'?' if rtt_ms is None else f'{rtt_ms:.0f}ms'}"
+
+        if loss_pct > self.LOSS_DOWN_PCT or rtt_spiking:
+            self._healthy = 0
+            target = self._clamp(int(self.current_kbps * self.DECREASE_FACTOR))
+            if target < self.current_kbps:
+                self._apply(target, why)
+                # The cut only helps once the client can decode again: whatever
+                # the congestion just ate, the phone is now missing reference
+                # frames and will stay grey/blocky until the next IDR, which at
+                # key-int-max = 2 s is up to two seconds of garbage. Ask for one
+                # now, with SPS/PPS attached, so recovery is immediate.
+                self._force_keyframe()
+            return
+
+        if loss_pct < self.LOSS_UP_PCT and not rtt_spiking:
+            self._healthy += 1
+            if self._healthy >= self.HEALTHY_STREAK:
+                self._healthy = 0
+                step = max(1, int(self.max_kbps * self.INCREASE_FRACTION))
+                target = self._clamp(self.current_kbps + step)
+                if target > self.current_kbps:
+                    self._apply(target, why)
+            return
+
+        # The grey zone (1%..5% loss): hold, and make the client earn its way
+        # back up from a clean streak.
+        self._healthy = 0
+
+    # -- actuation ----------------------------------------------------------
+    def _clamp(self, kbps: int) -> int:
+        return max(self.min_kbps, min(self.max_kbps, int(kbps)))
+
+    def _apply(self, target_kbps: int, why: str) -> None:
+        old = self.current_kbps
+        if not self._set_encoder_bitrate(target_kbps):
+            return
+        self.current_kbps = target_kbps
+        self._last_apply = time.monotonic()
+        log(f"abr: {old} -> {target_kbps} kbps ({why})")
+        self._notify(None if self._rtt_ewma is None else self._rtt_ewma * 1000.0)
+
+    def set_ceiling(self, max_kbps: int, min_kbps=None) -> None:
+        """Manual control moved the ceiling (a client 'cap it at 6 Mbps').
+
+        Lowering takes effect immediately — a cap the user asked for is a safety
+        action.  Raising only grants headroom; the controller still has to earn
+        its way up there, which is the whole point of the streak counter.
+        """
+        self.max_kbps = max(1, int(max_kbps))
+        if min_kbps is not None:
+            self.min_kbps = max(1, int(min_kbps))
+        self.min_kbps = min(self.min_kbps, self.max_kbps)
+        target = self._clamp(self.current_kbps)
+        if target != self.current_kbps:
+            self._apply(target, f"ceiling {self.max_kbps} kbps")
+
+    def _set_encoder_bitrate(self, kbps: int) -> bool:
+        enc = self.encoder
+        if enc is None or not self._can_set_bitrate:
+            return False
+        try:
+            # vah264enc, vah264lpenc and x264enc all take kbps here, and all
+            # three accept the change while PLAYING (see configure_encoder()).
+            enc.set_property("bitrate", int(kbps))
+            return True
+        except Exception as exc:
+            self._disable(f"cannot set {self.encoder_name}.bitrate ({exc!r})")
+            return False
+
+    def _force_keyframe(self) -> None:
+        if GstVideo is None:
+            return
+        try:
+            pad = self.encoder.get_static_pad("src")
+            if pad is None:
+                return
+            # Upstream force-key-unit, sent to the encoder's *source* pad, is
+            # how GstVideoEncoder is asked for an IDR from downstream.
+            # all_headers=True so SPS/PPS ride along and a client that lost them
+            # can start decoding cold.
+            event = GstVideo.video_event_new_upstream_force_key_unit(
+                Gst.CLOCK_TIME_NONE, True, 0)
+            if not pad.send_event(event):
+                dbg("abr: force-key-unit not handled by the encoder")
+        except Exception as exc:             # never fatal: it is only a nudge
+            dbg(f"abr: force-keyframe failed ({exc!r})")
+
+    # -- plumbing -----------------------------------------------------------
+    def _notify(self, rtt_ms=None) -> None:
+        cb = self.on_sample
+        if cb is None:
+            return
+        try:
+            cb(self.current_kbps, rtt_ms)
+        except Exception as exc:             # a status hop must not matter
+            dbg(f"abr: on_sample raised ({exc!r})")
+
+    def _disable(self, reason: str) -> None:
+        """One loud line, then this session streams at whatever it is at now.
+        A broken controller is a fixed-bitrate stream, never a dead one."""
+        if self._failed:
+            return
+        self._failed = True
+        err(f"abr: disabled for this session — {reason}")
+        err(f"abr: streaming continues at {self.current_kbps} kbps")
+
+
 # ------------------------------------------------------------------ sdp ----
 
 def sdp_from_text(text: str) -> GstSdp.SDPMessage:
@@ -346,15 +747,19 @@ def sdp_summary(text: str) -> str:
 class Streamer:
     """One capture + encode + webrtcbin pipeline, serving one client."""
 
-    def __init__(self, args, injector, on_fatal):
+    def __init__(self, args, injector, on_fatal, on_abr=None):
         self.args = args
         self.injector = injector
         self.on_fatal = on_fatal
+        self.on_abr = on_abr             # (kbps, rtt_ms) -> None, any thread
         self.encoder_name = pick_encoder(args.encoder)
         self.pipeline = None
         self.webrtc = None
         self.capture = None
         self.channel = None
+        self.abr = None
+        self.venc = None                 # the live encoder, for manual bitrate
+        self.config_snapshot = None      # () -> dict, sent right after the offer
         self.send_json = None            # set by attach(); GLib thread -> WS
         self._setup_done = False
         self._negotiation_wanted = False
@@ -460,6 +865,27 @@ class Streamer:
             if ret == Gst.StateChangeReturn.FAILURE:
                 raise StreamError("pipeline could not reach PLAYING")
 
+            # Adaptive bitrate is per-session: a fresh controller every client,
+            # so one bad link never leaves the next one throttled. Building it
+            # must never be able to stop the stream from starting.
+            if self.args.no_abr:
+                log(f"abr: off (--no-abr) — pinned to {self.args.bitrate} kbps")
+            else:
+                try:
+                    self.abr = AdaptiveBitrate(
+                        webrtc=self.webrtc,
+                        encoder=venc,
+                        encoder_name=self.encoder_name,
+                        max_kbps=self.args.bitrate,
+                        min_kbps=self.args.min_bitrate,
+                        on_sample=self.on_abr,
+                    )
+                    self.abr.start()
+                except Exception as exc:
+                    err(f"abr: could not start ({exc!r}) — fixed bitrate "
+                        f"{self.args.bitrate} kbps for this session")
+                    self.abr = None
+
             self._setup_done = True
         # Offer only once everything above is wired; on-negotiation-needed may
         # already have fired and parked itself in _negotiation_wanted.
@@ -547,6 +973,11 @@ class Streamer:
             GstWebRTC.WebRTCSDPType.ANSWER, msg)
         self.webrtc.emit("set-remote-description", answer, Gst.Promise.new())
         log(f"webrtc: remote answer set — {sdp_summary(sdp_text)}")
+        # Media only starts flowing now, and the SSRCs may be brand new: restart
+        # the controller's settle window so it does not judge the link on the
+        # first ICE/DTLS-shaped second.
+        if self.abr is not None:
+            self.abr.renegotiated()
         return False
 
     def apply_ice(self, mline_index: int, candidate: str) -> bool:
@@ -630,6 +1061,11 @@ class Streamer:
             self._negotiation_wanted = False
             self._sendonly_done = False
             self.channel = None
+            # Stop sampling *before* the pipeline goes away, so no get-stats
+            # lands on a half-NULL webrtcbin.
+            if self.abr is not None:
+                self.abr.stop()
+                self.abr = None
             if self.pipeline is not None:
                 log("pipeline: -> NULL")
                 bus = self.pipeline.get_bus()
@@ -1481,30 +1917,56 @@ class Daemon:
         self.on_fatal = on_fatal
         self.hub = hub
         self.loop = asyncio.get_running_loop()
-        self.streamer = Streamer(args, injector, on_fatal)
+        self.streamer = Streamer(args, injector, on_fatal, on_abr=self._on_abr)
         self.client = None
         self.gate = asyncio.Lock()
+        # Latest numbers from the adaptive-bitrate controller. Seeded with the
+        # ceiling so a session that has not sampled yet still reads sanely.
+        self._abr_kbps = args.bitrate
+        self._rtt_ms = None
 
     # -- hub status ---------------------------------------------------------
+    def _on_abr(self, kbps: int, rtt_ms) -> None:
+        """THREAD BOUNDARY 5: GStreamer/GLib thread -> asyncio loop.  The ABR
+        controller samples on the GLib thread; the hub connector's status feed
+        is loop-affine, so hop before touching it."""
+        self.loop.call_soon_threadsafe(self._abr_update, kbps, rtt_ms)
+
+    def _abr_update(self, kbps: int, rtt_ms) -> None:
+        """Runs on the asyncio loop."""
+        self._abr_kbps = kbps
+        if rtt_ms is not None:
+            self._rtt_ms = rtt_ms
+        self._publish_hub()
+
     def _publish_hub(self) -> None:
         """Push the current session state onto the hub bus.  Called from the
-        attach/detach seams (and once at startup to seed `idle`)."""
+        attach/detach seams, once at startup to seed `idle`, and on every ABR
+        sample.  set_status() only wakes the sender on a real change, and the
+        connector still pre-throttles to <= 4 sends/s, so a 1 Hz feed is free."""
         if self.hub is None:
             return
         streaming = self.client is not None
-        self.hub.set_status(
-            state="streaming" if streaming else "idle",
-            client=streaming,
-            # Configured encoder bitrate in Mbps while streaming, 0 when idle.
-            # Real *measured* bitrate is future work — this is the target we ask
-            # the encoder for (args.bitrate is kbps).
-            bitrate=round(self.args.bitrate / 1000.0, 3) if streaming else 0,
-            # latency (glass-to-glass) is deliberately OMITTED: the server does
-            # not currently see the client<->server RTT.  The datachannel
-            # ping/pong is measured on the *client* and never echoed back here,
-            # so sending anything now would be fabricated.  This key lands once
-            # the client reports its measured RTT to the server.
-        )
+        fields = {
+            "state": "streaming" if streaming else "idle",
+            "client": streaming,
+            # The bitrate the encoder is *currently* running at, in Mbps — the
+            # adaptive controller's live value, not the configured ceiling.
+            # 0 when idle.
+            "bitrate": round(self._abr_kbps / 1000.0, 3) if streaming else 0,
+        }
+        # `latency` used to be omitted because the server had no RTT at all: the
+        # datachannel ping/pong is measured on the *client* and never echoed
+        # back.  RTCP receiver reports give us the real network round trip now,
+        # so the field is honest — it is the transport RTT, which is the floor
+        # of glass-to-glass, not the whole of it.
+        if streaming:
+            if self._rtt_ms is not None:
+                fields["latency"] = round(self._rtt_ms, 1)
+        else:
+            fields["latency"] = 0          # explicit, so the card does not keep
+                                           # showing the last session's RTT
+        self.hub.set_status(**fields)
 
     # -- WS <-> GStreamer ---------------------------------------------------
     def _sender(self, ws):
@@ -1535,6 +1997,10 @@ class Daemon:
                 if self.injector:
                     self.injector.release_all()
             self.client = ws
+            # Fresh session, fresh numbers: never report the previous client's
+            # RTT or throttled bitrate against this one.
+            self._abr_kbps = self.args.bitrate
+            self._rtt_ms = None
             log(f"ws: client {peer} connected — building pipeline")
             try:
                 await self.loop.run_in_executor(
@@ -1615,7 +2081,13 @@ class Daemon:
             "encoder": self.streamer.encoder_name,
             "capture": bool(cap and cap.alive()),
             "geometry": f"{self.args.width}x{self.args.height}@{self.args.fps}",
-            "bitrate": self.args.bitrate / 1000.0,
+            # `bitrate` stays the live one (Mbps) so existing readers keep
+            # meaning the same thing; the ceiling is alongside it.
+            "bitrate": round(self._abr_kbps / 1000.0, 3),
+            "bitrate_max": self.args.bitrate / 1000.0,
+            "bitrate_min": self.args.min_bitrate / 1000.0,
+            "abr": not self.args.no_abr,
+            "rtt_ms": None if self._rtt_ms is None else round(self._rtt_ms, 1),
             "input": self.injector.label if self.injector else "none",
             "input_ready": bool(getattr(self.injector, "connected",
                                         self.injector is not None)),
@@ -1671,7 +2143,17 @@ def parse_args(argv=None):
     p.add_argument("--height", type=int, default=2400)
     p.add_argument("--fps", type=int, default=60)
     p.add_argument("--port", type=int, default=8765)
-    p.add_argument("--bitrate", type=int, default=12000, help="kbps")
+    # The *ceiling*, not a fixed rate: adaptive bitrate starts below it and
+    # never exceeds it. 8000 rather than 12000 because 12 Mbps of 1080x2400
+    # demonstrably overruns a 5G uplink and takes the whole session down.
+    p.add_argument("--bitrate", type=int, default=8000,
+                   help="kbps ceiling (default 8000)")
+    p.add_argument("--min-bitrate", type=int, default=1500,
+                   help="kbps floor the adaptive controller will not go below "
+                        "(default 1500)")
+    p.add_argument("--no-abr", action="store_true",
+                   help="disable adaptive bitrate and pin the encoder to "
+                        "--bitrate (the pre-0.2 behaviour)")
     p.add_argument("--wayland-display", required=True,
                    help="wayland socket of the headless session, e.g. wayland-1")
     p.add_argument("--output", default="HEADLESS-1", help="wlr output to capture")
@@ -1707,6 +2189,12 @@ def parse_args(argv=None):
     args = p.parse_args(argv)
     if args.no_input:
         args.input = "none"
+    if args.min_bitrate < 1:
+        args.min_bitrate = 1
+    if args.min_bitrate > args.bitrate:
+        warn(f"--min-bitrate {args.min_bitrate} is above --bitrate "
+             f"{args.bitrate}; clamping the floor to the ceiling")
+        args.min_bitrate = args.bitrate
     if args.adb is None:
         args.adb = shutil.which("adb")
 

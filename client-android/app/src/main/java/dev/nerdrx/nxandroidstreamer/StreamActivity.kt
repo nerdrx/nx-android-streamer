@@ -272,7 +272,12 @@ class StreamActivity : AppCompatActivity(), StreamClient.Listener, StreamView.Ca
             port = profile.port,
             autoReconnect = { prefsImpl.autoReconnect },
             listener = this
-        ).also { it.start() }
+        ).also {
+            // Seed the user's quality choices before connecting; the client
+            // re-sends them whenever the socket (re)opens.
+            it.sendConfig(prefsImpl.bitrateKbps, prefsImpl.fps, prefsImpl.adaptiveBitrate)
+            it.start()
+        }
     }
 
     private fun stopStream() {
@@ -354,6 +359,11 @@ class StreamActivity : AppCompatActivity(), StreamClient.Listener, StreamView.Ca
     override fun onScanQr() { requestScan() }
     override fun currentRttMs(): Int? = currentRtt
     override fun currentResolution(): String? = currentRes
+
+    override fun onQualityChanged() {
+        // Apply live to the running session; StreamClient re-sends on reconnect.
+        client?.sendConfig(prefsImpl.bitrateKbps, prefsImpl.fps, prefsImpl.adaptiveBitrate)
+    }
 
     override fun onSettingsChanged() {
         streamView.setScaling(prefsImpl.scaling)

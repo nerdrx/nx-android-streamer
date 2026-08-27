@@ -91,6 +91,9 @@ class StreamClient(
     private var pcConnected = false
 
     private var lastPhase: Phase? = null
+    // Last quality settings the user chose; re-sent on every (re)connect so the
+    // server always matches the phone's UI, including after a drop.
+    private var pendingConfig: Triple<Int, Int, Boolean>? = null
 
     private val pingRunnable = object : Runnable {
         override fun run() {
@@ -131,6 +134,26 @@ class StreamClient(
     /** Suppress the pong watchdog tripping on time the phone spent asleep. */
     fun noteAwake() {
         lastPongAt = System.currentTimeMillis()
+    }
+
+    /**
+     * Push stream-quality settings to the server over the signaling socket.
+     * Safe to call any time: if the socket isn't open yet the settings ride
+     * along on the next connect (sendConfig is called again once ws opens).
+     */
+    fun sendConfig(bitrateKbps: Int, fps: Int, abr: Boolean) {
+        pendingConfig = Triple(bitrateKbps, fps, abr)
+        val sock = ws ?: return
+        val msg = JSONObject()
+            .put("type", "config")
+            .put("bitrate", bitrateKbps)
+            .put("fps", fps)
+            .put("abr", abr)
+        try {
+            sock.send(msg.toString())
+        } catch (e: Exception) {
+            Log.w(TAG, "config send failed: ${e.message}")
+        }
     }
 
     fun stop() {
@@ -185,7 +208,11 @@ class StreamClient(
         val request = Request.Builder().url(url).build()
         ws = httpClient.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
-                main.post { if (myGen == gen) Log.d(TAG, "ws open, waiting for offer") }
+                main.post {
+                    if (myGen != gen) return@post
+                    Log.d(TAG, "ws open, waiting for offer")
+                    pendingConfig?.let { (b, f, a) -> sendConfig(b, f, a) }
+                }
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
@@ -209,6 +236,11 @@ class StreamClient(
             "offer" -> handleOffer(msg.optString("sdp"), myGen)
             "ice" -> handleRemoteIce(msg, myGen)
             "answer" -> { /* we are never the offerer */ }
+            "config" -> {
+                // Server's effective settings — it clamps, so this is the truth.
+                Log.d(TAG, "server config: ${msg.optInt("bitrate")}kbps " +
+                    "${msg.optInt("fps")}fps abr=${msg.optBoolean("abr")}")
+            }
             else -> {}
         }
     }
