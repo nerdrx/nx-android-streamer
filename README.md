@@ -45,12 +45,12 @@ This project quotes generously and credits loudly.
 │      │ wayland surface                  │        │  (v0.1: PWA,         │
 │  headless compositor                    │        │   v0.2+: Kotlin)     │
 │   v0.1: sway + xdg-desktop-portal-wlr   │        │                      │
-│   v1.0: nx-compositor (wlroots, direct  │  video │  MediaCodec AV1/HEVC │
+│   v1.0: nx-compositor (wlroots, direct  │  video │  MediaCodec H.264    │
 │         dmabuf → encoder, seat-level    │ ─────► │  low-latency decode  │
 │         touch injection)                │ WebRTC │  90 Hz frame pacing  │
 │      │ dmabuf / pipewire                │ ◄───── │                      │
 │  nx-streamerd                           │  touch │  immersive fullscreen│
-│   GStreamer: VAAPI HEVC/AV1 encode      │  audio │  gesture passthrough │
+│   GStreamer: VAAPI H.264 encode         │  audio │  gesture passthrough │
 │   webrtcbin + signaling + auth          │        │                      │
 │   input inject (v0.1: uinput)           │        │                      │
 └─────────────────────────────────────────┘        └──────────────────────┘

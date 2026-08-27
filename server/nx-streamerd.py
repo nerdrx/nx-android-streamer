@@ -2040,6 +2040,20 @@ class ScrcpyInjector(Injector):
             f"scid={self.scid:08x}, control-only)")
         self._tasks.append(asyncio.ensure_future(self._pump_server_log()))
 
+        # Reap forwards left behind by daemons that were killed hard: each run
+        # creates one and only removes it on a clean exit, so a few SIGKILLs
+        # during development leave a pile of them pointing at dead scrcpy
+        # sockets. Harmless individually, but they accumulate forever.
+        try:
+            listing = await self._run("forward", "--list", check=False)
+            for line in (listing or "").splitlines():
+                parts = line.split()
+                if len(parts) >= 3 and parts[2].startswith("localabstract:scrcpy_"):
+                    await self._run("forward", "--remove", parts[1], check=False)
+                    dbg(f"input: removed stale forward {parts[1]} -> {parts[2]}")
+        except Exception as exc:
+            dbg(f"input: could not tidy stale forwards ({exc!r})")
+
         forward = await self._run("forward", "tcp:0", f"localabstract:{socket_name}")
         try:
             self.port = int(forward.split()[-1])
