@@ -1,0 +1,19 @@
+name: checks
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash syntax
+        run: bash -n start.sh && bash -n scripts/release.sh
+      - name: python syntax
+        run: python3 -m py_compile server/nx-streamerd.py
+      - name: js syntax
+        run: node --check web/app.js
+      - name: manifest is valid json
+        run: python3 -c "import json; json.load(open('nx-app.json'))"

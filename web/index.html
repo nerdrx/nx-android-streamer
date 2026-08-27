@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- viewport-fit=cover so the stream goes edge to edge under the cutout/gesture bar;
+     the status pill uses env(safe-area-inset-*) to stay clear of them. -->
+<meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#0a0a12">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="NX Phone">
+<meta name="referrer" content="no-referrer">
+<title>NX Android Streamer</title>
+<link rel="manifest" href="manifest.json">
+<link rel="icon" type="image/svg+xml" href="icon.svg">
+<link rel="apple-touch-icon" href="icon.svg">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- The stage is the whole app: the video is the UI. Everything else is chrome
+       that gets out of the way. -->
+  <div id="stage">
+    <video id="video" autoplay playsinline muted disablepictureinpicture></video>
+  </div>
+  <div id="pill" class="pill" role="status" aria-live="polite">connecting…</div>
+  <script src="app.js"></script>
+</body>
+</html>

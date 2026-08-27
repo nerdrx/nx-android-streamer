@@ -13,18 +13,43 @@ back; every layer is tuned so the result is indistinguishable from local.
 
 ```
 waydroid show-full-ui
-  → sway (WLR_BACKENDS=headless,libinput, output 1080×2400@90)
-  → xdg-desktop-portal-wlr → PipeWire
-  → GStreamer: pipewiresrc ! vapostproc ! vah265enc (or AV1) ! webrtcbin
+  → sway (WLR_BACKENDS=headless, output 1080×2400@90)
+  → wf-recorder -c rawvideo → fifo
+  → GStreamer: filesrc ! rawvideoparse ! vah264enc ! rtph264pay ! webrtcbin
   → phone
-phone touch → WebRTC datachannel → nx-streamerd → uinput virtual touchscreen
-  → libinput → sway → waydroid surface
+phone touch → WebRTC datachannel → nx-streamerd → adb tunnel
+  → scrcpy server (control-only) → android InputManager
 ```
 
-Known trap, already encoded in `start.sh`: plain `WLR_BACKENDS=headless` gives
-sway **no input backend at all**, so injected uinput devices go nowhere. It must
-be `headless,libinput` (plus `WLR_LIBINPUT_NO_DEVICES=1` so sway tolerates
-starting with zero devices).
+### Why touch goes around the compositor
+
+The obvious path is a uinput virtual touchscreen: kernel → libinput → sway →
+waydroid surface. It doesn't work here, and the reason is worth writing down.
+
+A libinput backend needs a **seat** (logind or seatd). Our sway is started
+headless from a shell with no seat of its own, so `WLR_BACKENDS=headless,libinput`
+makes sway die at startup; plain `WLR_BACKENDS=headless` starts fine but has no
+input backend at all, so uinput devices are created, appear in `/dev/input`, and
+are read by nobody. Either way the tap never lands.
+
+So v0.1 skips the host input stack entirely and injects **inside Android**,
+through the same control socket scrcpy uses:
+
+- `adb push` scrcpy's server jar, start it control-only (`video=false
+  audio=false control=true tunnel_forward=true`), `adb forward` a TCP port onto
+  its `localabstract:scrcpy_<scid>` socket, and write 32-byte
+  `INJECT_TOUCH_EVENT` messages at it (see BORROWED.md).
+- With video disabled the server does no coordinate mapping, so we send device
+  pixels directly — our capture geometry and Android's display are the same
+  1080×2400 by construction.
+- The tradeoff: it depends on adb reaching the container (Waydroid needs its
+  network up, and `service.adb.tcp.port` set for adbd to listen on TCP), and it
+  bypasses the compositor, so a future non-Waydroid client would need its own
+  path.
+
+`--input uinput` keeps the evdev multitouch device for rigs that *do* have a
+seat — a normal desktop session, or a nested compositor with seatd — and
+`--input none` streams video only.
 
 ### v1.0 (nx-compositor)
 

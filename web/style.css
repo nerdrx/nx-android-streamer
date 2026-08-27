@@ -1,0 +1,134 @@
+/* NX Android Streamer — v0.1 phone client.
+   Deep space (#0a0a12), one accent (#7700FF), one piece of chrome (the pill). */
+
+:root {
+  --nx-void: #0a0a12;
+  --nx-accent: #7700ff;
+  --nx-text: #e8e6f2;
+  --nx-text-dim: #9c98b4;
+  --pill-top: 10px;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  background: var(--nx-void);
+  color: var(--nx-text);
+  font: 500 13px/1 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+body {
+  overflow: hidden;
+  overscroll-behavior: none;         /* no pull-to-refresh / rubber band */
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;       /* no long-press callout over the stream */
+  -webkit-tap-highlight-color: transparent;
+  touch-action: none;
+}
+
+/* --- stage ------------------------------------------------------------- */
+
+#stage {
+  position: fixed;
+  inset: 0;
+  background: var(--nx-void);
+  touch-action: none;                /* required: we own every gesture */
+  cursor: default;
+}
+
+/* Fills the viewport, letterboxed on #0a0a12. Portrait content on a portrait
+   phone means the bars are usually zero-width — but the input math never
+   assumes that (see app.js contentRect()). */
+#video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: var(--nx-void);
+  display: block;
+  pointer-events: none;              /* pointer events land on #stage, not here */
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* Faint accent breathing behind the void until the first frame arrives.
+   Killed the moment we go live so a steady stream costs zero compositing. */
+#stage::before {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 60vmin;
+  height: 60vmin;
+  transform: translate(-50%, -50%);
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(119, 0, 255, 0.20) 0%, rgba(119, 0, 255, 0) 70%);
+  opacity: 1;
+  transition: opacity 400ms ease;
+  pointer-events: none;
+}
+
+body.live #stage::before { opacity: 0; }
+
+/* --- status pill ------------------------------------------------------- */
+
+.pill {
+  position: fixed;
+  top: calc(env(safe-area-inset-top, 0px) + var(--pill-top));
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 13px;
+  border-radius: 999px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.01em;
+  color: var(--nx-text);
+  white-space: nowrap;
+  pointer-events: none;              /* never eats a touch meant for the stream */
+
+  /* liquid glass on deep space */
+  background: rgba(20, 18, 34, 0.55);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow: 0 2px 14px rgba(0, 0, 0, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  -webkit-backdrop-filter: blur(14px) saturate(140%);
+  backdrop-filter: blur(14px) saturate(140%);
+
+  opacity: 1;
+  transition: opacity 500ms ease;
+}
+
+.pill.faded { opacity: 0; }
+
+/* Status dot: accent while working, solid accent when live. */
+.pill::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--nx-accent);
+  box-shadow: 0 0 8px rgba(119, 0, 255, 0.9);
+  flex: none;
+}
+
+.pill.waiting::before { animation: nx-pulse 1.4s ease-in-out infinite; }
+.pill.waiting { color: var(--nx-text-dim); }
+
+@keyframes nx-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.25; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pill.waiting::before { animation: none; }
+  .pill, #stage::before { transition: none; }
+}
