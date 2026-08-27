@@ -25,5 +25,12 @@ rm -rf "${DIST:?}/$NAME"
 cd "$DIST"
 for f in *.tar.gz *.apk; do [[ -f $f ]] && sha256sum "$f" > "$f.sha256"; done
 
-gh release create "v${V}" "$DIST"/* "$ROOT/nx-app.json" \
-    --title "v${V}" --generate-notes
+# Create the release WITHOUT assets first (fast, atomic — a slow asset upload
+# can't leave the release stuck as a draft), then upload assets, then flip it
+# to published+latest. gh's default create-with-assets left drafts when a large
+# APK upload was interrupted.
+gh release create "v${V}" --title "v${V}" --generate-notes --draft
+gh release upload "v${V}" "$DIST"/* "$ROOT/nx-app.json" --clobber
+gh release edit "v${V}" --draft=false --latest
+
+echo "published: $(gh release view "v${V}" --json url -q .url)"
