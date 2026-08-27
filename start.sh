@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # nx-android-streamer — starter script
 # Brings up a headless Waydroid session at phone geometry, ready for a streamer.
-# Subcommands: setup | arm | up | stream | doctor | down | status | ref
+# Subcommands: setup | arm | up | serve | stream | doctor | down | status | ref
 set -euo pipefail
 
 W=${NXAS_WIDTH:-1080}
@@ -141,6 +141,26 @@ EOF
 
     log "up ✓  wayland display: $disp — android is booting inside it"
     log "streamer hookup: WAYLAND_DISPLAY=$disp (nx-streamerd / './start.sh ref' for sunshine baseline)"
+}
+
+# ---------------------------------------------------------------- serve ----
+cmd_serve() {
+    # One-shot "bring the whole phone online" — this is what NX Hub's Launch
+    # runs. It boots the headless session if it isn't up, optionally repairs
+    # the waydroid network/adb path, then runs the streamer in the foreground
+    # so the hub tracks THIS process: the daemon connects to the hub's status
+    # bus (live state/bitrate/client on the card) and a hub Stop / stack
+    # shutdown-request lands on it directly.
+    if ! { [[ -f $RUN/sway.pid ]] && kill -0 "$(cat "$RUN/sway.pid" 2>/dev/null)" 2>/dev/null; }; then
+        cmd_up
+    else
+        log "session already up (sway pid $(cat "$RUN/sway.pid"))"
+    fi
+    # best-effort adb repair so touch works; never fatal — video streams regardless
+    if need adb && ! adb devices 2>/dev/null | grep -q "5555[[:space:]]*device"; then
+        log "adb not connected to android yet — run './start.sh doctor' if touch is dead"
+    fi
+    cmd_stream "$@"
 }
 
 # --------------------------------------------------------------- stream ----
@@ -332,6 +352,7 @@ case "${1:-help}" in
     setup)  cmd_setup ;;
     arm)    cmd_arm ;;
     up)     cmd_up ;;
+    serve)  cmd_serve "${@:2}" ;;
     stream) cmd_stream "${@:2}" ;;
     down)   cmd_down ;;
     status) cmd_status ;;
