@@ -139,6 +139,18 @@ path a negotiation:
 - `<source-name>` — capture a named PulseAudio source verbatim, for a rig that
   already routes Waydroid somewhere deliberate.
 
+Debugging note: **Discord names its PulseAudio stream "WEBRTC VoiceEngine"**,
+which is indistinguishable by name from something a WebRTC streamer would
+create. It cost real time chasing a "leak" that was just Discord playing on the
+desktop. Ignore names, look at the graph:
+
+```
+pw-link -l | grep -A3 '^nxas_waydroid:playback'   # must list ONLY Waydroid:output_*
+pw-link -l | grep -A3 'nxas_waydroid:monitor'     # must feed no speaker
+ss -tnp | grep :8765                              # who is really attached
+```
+
+
 The branch is a second sendonly transceiver on the *same* `webrtcbin`:
 `pulsesrc ! audioconvert ! audioresample ! opusenc ! rtpopuspay ! webrtc.`,
 pt=97, 48 kHz stereo, mtu 1100 like the video (Tailscale's 1280-byte MTU).
